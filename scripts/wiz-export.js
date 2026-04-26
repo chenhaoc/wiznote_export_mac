@@ -17,13 +17,14 @@ const DEFAULT_LIVE_EDITOR =
   "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js";
 const DEFAULT_OUT = path.resolve(process.cwd(), "export");
 
-const COMMANDS = new Set(["status", "snapshot", "export", "help"]);
+const COMMANDS = new Set(["status", "snapshot", "export", "upgrade-legacy", "help"]);
 
 function usage() {
   return `Usage:
   node scripts/wiz-export.js status [--json] [--profile PATH]
   node scripts/wiz-export.js snapshot [--json] [--profile PATH]
-  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--coedit-only] [--attachments] [--attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
 
 Options:
   --out DIR          Export output directory. Default: ./export
@@ -31,9 +32,12 @@ Options:
   --allow-partial    Export notes with local bodies and skip missing ones
   --fetch-missing    Fetch/sync missing note bodies from WizNote server during export
   --resume           Skip exported notes that are already fresh in the output directory
+  --skip-failed      With --resume, keep previous failed notes in the manifest and skip retrying them
+  --skip-web-clips   Skip notes imported/clipped from web pages
   --coedit-only      Export only collaboration notes and skip legacy HTML notes
   --attachments      Download collaboration-note file links and rewrite them into .assets/
   --attachments-only Update an existing export directory with collaboration attachments only
+  --dry-run          Convert legacy notes and report what would be uploaded without writing to WizNote
   --simple-html      Use a faster, lower-fidelity converter for standard HTML notes
   --wait             Poll until local note bodies look complete
   --poll-ms N        Poll interval for --wait. Default: 60000
@@ -56,9 +60,12 @@ function parseArgs(argv) {
     allowPartial: false,
     fetchMissing: false,
     resume: false,
+    skipFailed: false,
+    skipWebClips: false,
     coeditOnly: false,
     downloadAttachments: false,
     attachmentsOnly: false,
+    dryRun: false,
     simpleHtml: false,
     wait: false,
     pollMs: 60000,
@@ -77,12 +84,15 @@ function parseArgs(argv) {
     else if (a === "--allow-partial") args.allowPartial = true;
     else if (a === "--fetch-missing") args.fetchMissing = true;
     else if (a === "--resume" || a === "--skip-existing") args.resume = true;
+    else if (a === "--skip-failed") args.skipFailed = true;
+    else if (a === "--skip-web-clips") args.skipWebClips = true;
     else if (a === "--coedit-only") args.coeditOnly = true;
     else if (a === "--attachments" || a === "--download-attachments") args.downloadAttachments = true;
     else if (a === "--attachments-only") {
       args.attachmentsOnly = true;
       args.downloadAttachments = true;
     }
+    else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--simple-html") args.simpleHtml = true;
     else if (a === "--wait") args.wait = true;
     else if (a === "--json") args.json = true;
@@ -138,6 +148,19 @@ async function pathExists(p) {
   } catch {
     return false;
   }
+}
+
+function isPathInside(parentDir, candidatePath) {
+  const relative = path.relative(path.resolve(parentDir), path.resolve(candidatePath));
+  return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+async function removeExportArtifact(outDir, relativePath) {
+  if (!relativePath) return false;
+  const target = path.resolve(outDir, relativePath);
+  if (!isPathInside(outDir, target)) return false;
+  await fsp.rm(target, { recursive: true, force: true });
+  return true;
 }
 
 async function getFreePort() {
@@ -241,14 +264,25 @@ async function startOriginServer({ liveEditorPath, appPort }) {
       if (req.headers["x-wiz-token"]) headers["x-wiz-token"] = req.headers["x-wiz-token"];
       if (req.headers["x-live-editor-token"]) headers["x-live-editor-token"] = req.headers["x-live-editor-token"];
       if (req.headers["x-live-editor-base-url"]) headers["x-live-editor-base-url"] = req.headers["x-live-editor-base-url"];
+      if (req.headers["content-type"]) headers["content-type"] = req.headers["content-type"];
+      if (req.headers.accept) headers.accept = req.headers.accept;
+      const requestedTimeout = Number(req.headers["x-wiz-proxy-timeout-ms"]);
+      const proxyTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout >= 1000
+        ? Math.min(requestedTimeout, 300000)
+        : 120000;
       const chunks = [];
       req.on("data", (chunk) => chunks.push(chunk));
       req.on("end", () => {
         const body = chunks.length ? Buffer.concat(chunks) : undefined;
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 120000);
+        let completed = false;
+        const timer = setTimeout(() => controller.abort(), proxyTimeoutMs);
+        res.on("close", () => {
+          if (!completed) controller.abort();
+        });
         fetch(target, { method: req.method, headers, body, signal: controller.signal })
         .then(async (proxyRes) => {
+          completed = true;
           clearTimeout(timer);
           const buffer = Buffer.from(await proxyRes.arrayBuffer());
           res.writeHead(proxyRes.status, {
@@ -258,6 +292,7 @@ async function startOriginServer({ liveEditorPath, appPort }) {
           res.end(buffer);
         })
         .catch((err) => {
+          completed = true;
           clearTimeout(timer);
           res.writeHead(err.name === "AbortError" ? 504 : 502, { "content-type": "text/plain; charset=utf-8" });
           res.end(`Remote proxy failed: ${err.message}`);
@@ -424,7 +459,18 @@ async function withBrowser(args, fn, options = {}) {
   } finally {
     if (cdp) cdp.close();
     await terminateProcess(chrome);
-    await new Promise((resolve) => originServer.server.close(resolve));
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (typeof originServer.server.closeAllConnections === "function") {
+          originServer.server.closeAllConnections();
+        }
+        resolve();
+      }, 3000);
+      originServer.server.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
     if (!args.keepTemp) {
       try {
         await fsp.rm(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -538,6 +584,22 @@ if (!window.__WIZ_EXPORT__) {
   async function valueToBase64(value) {
     const buffer = await valueToArrayBuffer(value);
     return buffer ? arrayBufferToBase64(buffer) : null;
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const list = Array.from(items || []);
+    const out = new Array(list.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.max(1, Math.min(limit || 1, list.length || 1)) }, async () => {
+      for (;;) {
+        const index = next;
+        next += 1;
+        if (index >= list.length) return;
+        out[index] = await fn(list[index], index);
+      }
+    });
+    await Promise.all(workers);
+    return out;
   }
 
   function cloneWithoutData(value) {
@@ -850,9 +912,14 @@ if (!window.__WIZ_EXPORT__) {
       "type",
       "status",
       "tags",
+      "url",
       "created",
       "dataModified",
       "infoModified",
+      "protected",
+      "version",
+      "dataMd5",
+      "infoMd5",
     ]);
     const folders = trimRows(await readStoreEntries(userDbName, "folders", { omitData: true }), [
       "kbGuid",
@@ -909,29 +976,192 @@ if (!window.__WIZ_EXPORT__) {
     }
   }
 
-  async function fetchRemoteDocData(note, kb) {
+  async function fetchRemoteDocData(note, kb, options = {}) {
     if (!kb || !kb.kbServer) return { html: "", source: "remote-missing-kb-server" };
     const token = await getAccountToken();
     if (!token) return { html: "", source: "remote-missing-account-token" };
     const url = kb.kbServer + "/ks/note/download/" + note.kbGuid + "/" + note.docGuid + "?downloadInfo=1&downloadData=1";
+    const timeoutMs = options.timeoutMs || 15000;
     try {
       const response = await fetchWithTimeout("/__wiz_export_proxy?url=" + encodeURIComponent(url), {
-        headers: { "x-wiz-token": token },
-      }, 15000);
+        headers: {
+          "x-wiz-token": token,
+          "x-wiz-proxy-timeout-ms": String(timeoutMs + 2000),
+        },
+      }, timeoutMs);
       if (!response.ok) return { html: "", source: "remote-http-" + response.status };
       const json = await response.json().catch(() => null);
       if (!json) return { html: "", source: "remote-invalid-json" };
       if (json.returnCode && json.returnCode !== 200) {
         return { html: "", source: "remote-code-" + json.returnCode + ":" + (json.returnMessage || "") };
       }
-      if (json.html) return { html: json.html, source: "wiznote-server", resources: json.resources || [] };
-      if (json.result && json.result.html) {
-        return { html: json.result.html, source: "wiznote-server", resources: json.result.resources || [] };
+      const payload = json.result && (json.result.html || json.result.info || json.result.url || json.result.resources)
+        ? json.result
+        : json;
+      if (payload.html) {
+        return {
+          html: payload.html,
+          source: "wiznote-server",
+          resources: payload.resources || [],
+          info: payload.info || null,
+          url: payload.url || "",
+        };
       }
-      return { html: "", source: json.url ? "remote-ziw-document" : "remote-no-html" };
+      return { html: "", source: payload.url ? "remote-ziw-document" : "remote-no-html", info: payload.info || null };
     } catch (err) {
       return { html: "", source: "remote-error:" + err.message };
     }
+  }
+
+  async function remoteJson(kb, path, options = {}) {
+    if (!kb || !kb.kbServer) throw new Error("missing kbServer");
+    const token = await getAccountToken();
+    if (!token) throw new Error("missing account token");
+    const headers = {
+      "x-wiz-token": token,
+      "accept": "application/json",
+      "x-wiz-proxy-timeout-ms": String((options.timeoutMs || 30000) + 2000),
+    };
+    const fetchOptions = {
+      method: options.method || "GET",
+      headers,
+    };
+    if (options.body !== undefined) {
+      headers["content-type"] = "application/json;charset=utf-8";
+      fetchOptions.body = JSON.stringify(options.body);
+    }
+    const url = kb.kbServer + path;
+    const response = await fetchWithTimeout("/__wiz_export_proxy?url=" + encodeURIComponent(url), fetchOptions, options.timeoutMs || 30000);
+    const text = await response.text();
+    let json = null;
+    if (text) {
+      try {
+        json = JSON.parse(text);
+      } catch (err) {
+        throw new Error("remote invalid json: " + err.message);
+      }
+    }
+    if (!response.ok) throw new Error("remote http " + response.status + (text ? ": " + text.slice(0, 200) : ""));
+    if (json && json.returnCode && json.returnCode !== 200) {
+      throw new Error("remote code " + json.returnCode + ": " + (json.returnMessage || ""));
+    }
+    return json || {};
+  }
+
+  function isLiteMarkdownHtml(html) {
+    return /<!--wiznote-lite-markdown-->/.test(String(html || ""));
+  }
+
+  function removeTitleFromHtml(html) {
+    return String(html || "").replace(/<title>(.*?)<\/title>/i, "");
+  }
+
+  function processHtmlForMarkdown(html) {
+    return removeTitleFromHtml(html)
+      .replaceAll("wiz-editor-doc::", "")
+      .replaceAll("::wiz-editor-doc", "")
+      .replaceAll("<br /></p>", "</p>")
+      .replaceAll("<br /></h1>", "</h1>")
+      .replaceAll("<br /></h2>", "</h2>")
+      .replaceAll("<br /></h3>", "</h3>")
+      .replaceAll("<br /></h4>", "</h4>")
+      .replaceAll("<br /></h5>", "</h5>")
+      .replaceAll("<br /></h6>", "</h6>");
+  }
+
+  function stripMarkdownExt(title) {
+    return String(title || "Untitled").replace(/\.md$/i, "");
+  }
+
+  function escapeMarkdownTitle(title) {
+    if (window.LiveEditor && typeof window.LiveEditor.escapeMarkdownText === "function") {
+      return window.LiveEditor.escapeMarkdownText(String(title || ""));
+    }
+    const tick = String.fromCharCode(96);
+    return String(title || "")
+      .replace(/([\\*_{}\[\]()#+\-.!>])/g, "\\$1")
+      .replace(new RegExp(tick, "g"), "\\" + tick);
+  }
+
+  function firstLine(value) {
+    const text = String(value || "");
+    const index = text.search(/\r?\n/);
+    return index >= 0 ? text.slice(0, index) : text;
+  }
+
+  function liteMarkdownToHtml(markdown) {
+    const escaped = String(markdown || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    return "<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" >\n    <head></head>\n  </head>\n  <body>\n    <pre><!--wiznote-lite-markdown-->" +
+      escaped +
+      "</pre>\n  </body>\n</html>";
+  }
+
+  function liteResourceNamesFromMarkdown(markdown) {
+    const tick = String.fromCharCode(96);
+    const withoutCode = String(markdown || "")
+      .replace(new RegExp(tick + tick + tick + "[\\s\\S]*?" + tick + tick + tick, "g"), "")
+      .replace(new RegExp(tick + ".*?" + tick, "g"), "");
+    const names = [];
+    withoutCode.replace(/!\[[^\]]*]\(index_files\/([^)]*)/gi, (_match, name) => {
+      const clean = String(name || "").replace(/\s=[^.]*$/, "");
+      if (clean && !names.includes(clean)) names.push(clean);
+      return _match;
+    });
+    return names;
+  }
+
+  function markdownToPlainText(markdown, title) {
+    const tick = String.fromCharCode(96);
+    let text = String(markdown || "")
+      .replace(new RegExp(tick + tick + tick + "[\\s\\S]*?" + tick + tick + tick, "g"), " ")
+      .replace(new RegExp(tick + "([^" + tick + "]*)" + tick, "g"), "$1")
+      .replace(/!\[[^\]]*]\([^)]*\)/g, " ")
+      .replace(/\[([^\]]*)]\([^)]*\)/g, "$1")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/[*_~>#-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const cleanTitle = String(title || "").replace(/\\/g, "").trim();
+    if (cleanTitle && text.startsWith(cleanTitle)) text = text.slice(cleanTitle.length).trim();
+    return text;
+  }
+
+  function resourceMetaName(resource) {
+    if (typeof resource === "string") return resource;
+    return resource && (resource.name || resource.dataId || resource.resourceName || resource.fileName) || "";
+  }
+
+  function resourceMetaSize(resource) {
+    if (!resource || typeof resource === "string") return 0;
+    return Number(resource.size || resource.dataSize || resource.fileSize || resource.byteLength) || 0;
+  }
+
+  function uploadResourceMetas(remoteResources, resourceNames) {
+    const remote = Array.isArray(remoteResources) ? remoteResources : [];
+    return resourceNames.map((name) => {
+      const meta = remote.find((item) => resourceMetaName(item) === name || basenameFromUrl(resourceMetaName(item)) === basenameFromUrl(name));
+      return {
+        name,
+        time: meta && meta.time ? meta.time : Date.now(),
+        size: resourceMetaSize(meta),
+      };
+    });
+  }
+
+  function randomHex32() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function base64ToArrayBuffer(base64) {
+    const binary = atob(String(base64 || ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
   }
 
   function htmlAttr(tag, name) {
@@ -1289,13 +1519,12 @@ if (!window.__WIZ_EXPORT__) {
   }
 
   async function fetchNormalResource(note, kb, resourceName) {
+    const remote = await fetchRemoteNormalResource(note, kb, resourceName);
+    if (remote.ok) return remote;
     const url = "/ks/note/view/" + encodeURIComponent(note.kbGuid) + "/" + encodeURIComponent(note.docGuid) + "/index_files/" + encodeURIComponent(resourceName);
     try {
       const response = await fetchWithTimeout(url, { credentials: "include" }, 5000);
-      if (!response.ok) {
-        const remote = await fetchRemoteNormalResource(note, kb, resourceName);
-        return remote.ok ? remote : { ok: false, reason: "local-http-" + response.status + "; " + remote.reason };
-      }
+      if (!response.ok) return { ok: false, reason: remote.reason + "; local-http-" + response.status };
       const buffer = await response.arrayBuffer();
       return {
         ok: true,
@@ -1304,9 +1533,62 @@ if (!window.__WIZ_EXPORT__) {
         byteLength: buffer.byteLength,
       };
     } catch (err) {
-      const remote = await fetchRemoteNormalResource(note, kb, resourceName);
-      return remote.ok ? remote : { ok: false, reason: err.message + "; " + remote.reason };
+      return { ok: false, reason: remote.reason + "; " + err.message };
     }
+  }
+
+  async function uploadNormalResource(note, kb, resourceName, key, isLast) {
+    const token = await getAccountToken();
+    if (!token) return { ok: false, resourceName, reason: "missing-account-token" };
+    const source = await fetchRemoteNormalResource(note, kb, resourceName);
+    if (!source.ok || !source.base64) {
+      return {
+        ok: false,
+        resourceName,
+        reason: source.reason || "resource-download-failed",
+        source: source.source || "unknown",
+      };
+    }
+
+    const bytes = new Uint8Array(base64ToArrayBuffer(source.base64));
+    const chunkSize = 2000000;
+    const partCount = Math.max(1, Math.ceil(bytes.byteLength / chunkSize));
+    const uploadUrl = kb.kbServer + "/ks/object/upload/" + note.kbGuid + "/" + note.docGuid;
+    for (let partIndex = 0; partIndex < partCount; partIndex += 1) {
+      const start = partIndex * chunkSize;
+      const end = Math.min(start + chunkSize, bytes.byteLength);
+      const form = new FormData();
+      form.append("kbGuid", note.kbGuid);
+      form.append("docGuid", note.docGuid);
+      form.append("objId", resourceName);
+      form.append("objType", "resource");
+      form.append("key", key);
+      if (isLast !== undefined) form.append("isLast", String(isLast));
+      form.append("partIndex", String(partIndex));
+      form.append("partCount", String(partCount));
+      form.append("data", new Blob([bytes.slice(start, end)], { type: "application/octet-stream" }), basenameFromUrl(resourceName));
+      const response = await fetchWithTimeout("/__wiz_export_proxy?url=" + encodeURIComponent(uploadUrl), {
+        method: "POST",
+        headers: { "x-wiz-token": token },
+        body: form,
+      }, 60000);
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        return {
+          ok: false,
+          resourceName,
+          reason: "upload-http-" + response.status + (text ? ": " + text.slice(0, 200) : ""),
+          source: source.source,
+        };
+      }
+    }
+    return {
+      ok: true,
+      resourceName,
+      source: source.source,
+      byteLength: bytes.byteLength,
+      parts: partCount,
+    };
   }
 
   async function fetchCoEditResource(note, kb, resourceName, meta, options = {}) {
@@ -1378,6 +1660,134 @@ if (!window.__WIZ_EXPORT__) {
     };
   }
 
+  async function upgradeLegacyNote(payload) {
+    await installLiveEditor();
+    const { note, kb } = payload;
+    const dryRun = !!payload.dryRun;
+    if (isCoEdit(note.type)) {
+      return { ok: false, skipped: true, reason: "collaboration-not-supported" };
+    }
+
+    const downloaded = await fetchRemoteDocData(note, kb, { timeoutMs: 60000 });
+    if (!downloaded.html) {
+      return { ok: false, source: downloaded.source, error: "missing-remote-html" };
+    }
+    if (isLiteMarkdown(note.type) && isLiteMarkdownHtml(downloaded.html)) {
+      return {
+        ok: true,
+        skipped: true,
+        source: downloaded.source,
+        reason: "already-lite-markdown",
+        fromType: note.type || "",
+        toType: "lite/markdown",
+      };
+    }
+    const info = { ...(downloaded.info || {}) };
+    for (const [key, value] of Object.entries(note || {})) {
+      if (info[key] === undefined) info[key] = value;
+    }
+    if (info.protected || note.protected) {
+      return { ok: false, skipped: true, source: downloaded.source, reason: "protected-note-not-supported" };
+    }
+
+    const timeoutMs = Math.max(5000, Number(payload.convertTimeoutMs) || 90000);
+    const inputHtml = processHtmlForMarkdown(downloaded.html);
+    const doc = await withTimeout(
+      window.LiveEditor.html2Doc(inputHtml, { convertFont: false, convertList: true }),
+      timeoutMs,
+      "html2Doc"
+    );
+    const markdownBody = await withTimeout(
+      window.LiveEditor.doc2markdown(doc, { keepImageSize: true }),
+      timeoutMs,
+      "doc2markdown"
+    );
+    const escapedTitle = escapeMarkdownTitle(stripMarkdownExt(note.title || info.title || "Untitled"));
+    const titleLine = "# " + escapedTitle;
+    let markdown = String(markdownBody || "").trim();
+    if (!markdown.startsWith(titleLine)) {
+      const line = firstLine(markdown);
+      markdown = line.endsWith(titleLine)
+        ? titleLine + markdown.slice(line.length)
+        : titleLine + "\n" + String(markdownBody || "");
+    }
+    markdown = markdown.trim() + "\n";
+
+    const liteHtml = liteMarkdownToHtml(markdown);
+    const resourceNames = liteResourceNamesFromMarkdown(markdownBody);
+    const resources = uploadResourceMetas(downloaded.resources, resourceNames);
+    const abstractText = markdownToPlainText(markdownBody, escapedTitle).slice(0, 128);
+    const uploadDoc = { ...info };
+    delete uploadDoc.abstractText;
+    delete uploadDoc.params;
+    delete uploadDoc.html;
+    delete uploadDoc._key;
+    uploadDoc.kbGuid = note.kbGuid;
+    uploadDoc.docGuid = note.docGuid;
+    uploadDoc.title = uploadDoc.title || note.title || "";
+    uploadDoc.category = uploadDoc.category || note.category || "";
+    uploadDoc.type = "lite/markdown";
+    uploadDoc.status = "localDataModified";
+    uploadDoc.dataMd5 = randomHex32();
+    uploadDoc.html = liteHtml;
+    uploadDoc.resources = resources;
+
+    const baseResult = {
+      ok: true,
+      skipped: false,
+      dryRun,
+      source: downloaded.source,
+      fromType: note.type || "",
+      toType: "lite/markdown",
+      title: note.title || "",
+      markdownBytes: new TextEncoder().encode(markdown).byteLength,
+      htmlBytes: new TextEncoder().encode(liteHtml).byteLength,
+      abstractText,
+      resourceNames,
+      resources,
+    };
+    if (dryRun) return baseResult;
+
+    const uploadJson = await remoteJson(
+      kb,
+      "/ks/note/upload/" + note.kbGuid + "/" + note.docGuid,
+      { method: "POST", body: uploadDoc, timeoutMs: 45000 }
+    );
+    const uploadPayload = uploadJson.result && (uploadJson.result.key || uploadJson.result.resources)
+      ? uploadJson.result
+      : uploadJson;
+    const requested = Array.isArray(uploadPayload.resources) ? uploadPayload.resources : [];
+    const key = uploadPayload.key || "";
+    const uploadedResources = [];
+    if (requested.length && !key) {
+      return {
+        ...baseResult,
+        ok: false,
+        uploadKey: "",
+        uploadResponse: uploadPayload,
+        uploadResourcesRequested: requested,
+        uploadedResources,
+        error: "server-requested-resources-without-upload-key",
+      };
+    }
+    for (let i = 0; i < requested.length; i += 1) {
+      const item = requested[i];
+      const resourceName = resourceMetaName(item);
+      const uploaded = await uploadNormalResource(note, kb, resourceName, key, i === requested.length - 1 ? 1 : 0);
+      uploadedResources.push(uploaded);
+    }
+    const failedUploads = uploadedResources.filter((item) => !item.ok);
+    return {
+      ...baseResult,
+      ok: failedUploads.length === 0,
+      uploadKey: key,
+      uploadResponse: uploadPayload,
+      uploadResourcesRequested: requested,
+      uploadedResources,
+      error: failedUploads.length ? "resource-upload-failed" : undefined,
+    };
+  }
+
   async function convertNote(payload) {
     await installLiveEditor();
     const { note, kb, assetDirName } = payload;
@@ -1440,13 +1850,13 @@ if (!window.__WIZ_EXPORT__) {
       } else {
         let htmlData = await getHtmlData(note);
         if (!htmlData.html && payload.fetchMissing) {
-          htmlData = await fetchLocalViewDocData(note);
-          if (!htmlData.html) htmlData = await fetchRemoteDocData(note, kb);
+          htmlData = await fetchRemoteDocData(note, kb, { timeoutMs: isLiteMarkdown(note.type) ? 20000 : 30000 });
+          if (!htmlData.html && !isLiteMarkdown(note.type)) htmlData = await fetchLocalViewDocData(note);
         }
         source = htmlData.source;
         if (!htmlData.html) {
           missingBody = true;
-        } else if (isLiteMarkdown(note.type)) {
+        } else if (isLiteMarkdown(note.type) || isLiteMarkdownHtml(htmlData.html)) {
           markdown = extractLiteMarkdown(htmlData.html);
           if (markdown) source = source ? source + "-lite-markdown" : "lite-markdown";
           else missingBody = true;
@@ -1478,10 +1888,9 @@ if (!window.__WIZ_EXPORT__) {
         markdown = rewriteLocalAttachmentLinks(markdown, collector, assetDirName);
       }
 
-      const resources = [];
-      for (const ref of collector.refs) {
-        resources.push(await fillResourceData(note, kb, ref, coEditMeta));
-      }
+      const resources = await mapLimit(collector.refs, payload.resourceConcurrency || 6, (ref) =>
+        fillResourceData(note, kb, ref, coEditMeta)
+      );
 
       return {
         ok: !missingBody,
@@ -1519,6 +1928,7 @@ if (!window.__WIZ_EXPORT__) {
   });
   helper.readSnapshot = readSnapshot;
   helper.convertNote = convertNote;
+  helper.upgradeLegacyNote = upgradeLegacyNote;
   helper.fetchResources = fetchResources;
   window.__WIZ_EXPORT__ = helper;
 }
@@ -1570,6 +1980,18 @@ function isCoEdit(type) {
 
 function isLiteMarkdown(type) {
   return String(type || "").toLowerCase() === "lite/markdown";
+}
+
+function isLegacyUpgradeableDoc(doc) {
+  const type = String(doc.type || "").toLowerCase();
+  if (isCoEdit(type)) return false;
+  return true;
+}
+
+function isWebClipDoc(doc) {
+  const type = String(doc.type || "").toLowerCase();
+  if (type === "webnote" || type === "webclip" || type === "web") return true;
+  return /^https?:\/\//i.test(String(doc.url || "").trim());
 }
 
 function dataKey(kbGuid, docGuid, dataId) {
@@ -1972,6 +2394,174 @@ async function waitUntilReady(args) {
   }
 }
 
+function sortDocsByTree(docs) {
+  return docs.slice().sort((a, b) => {
+    const ca = String(a.category || "");
+    const cb = String(b.category || "");
+    if (ca !== cb) return ca.localeCompare(cb);
+    return String(a.title || "").localeCompare(String(b.title || ""));
+  });
+}
+
+function makeUpgradeRecord(doc, result) {
+  return {
+    docGuid: doc.docGuid,
+    kbGuid: doc.kbGuid,
+    title: doc.title || "",
+    category: doc.category || "",
+    fromType: result.fromType !== undefined ? result.fromType : (doc.type || ""),
+    toType: result.toType || "",
+    source: result.source || "",
+    dryRun: !!result.dryRun,
+    ok: !!result.ok,
+    skipped: !!result.skipped,
+    reason: result.reason,
+    error: result.error,
+    markdownBytes: result.markdownBytes || 0,
+    htmlBytes: result.htmlBytes || 0,
+    resources: result.resources || [],
+    resourceNames: result.resourceNames || [],
+    uploadResponse: result.uploadResponse,
+    uploadResourcesRequested: result.uploadResourcesRequested || [],
+    uploadedResources: result.uploadedResources || [],
+    updated: new Date(noteModifiedMs(doc)).toISOString(),
+  };
+}
+
+async function runUpgradeLegacy(args) {
+  const snapshot = await readSnapshot(args);
+  const status = statusFromSnapshot(snapshot);
+  const indexes = buildIndexes(snapshot);
+  let docs = sortDocsByTree(indexes.docs);
+  if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
+  const skippedByType = args.only ? docs.filter((doc) => !isLegacyUpgradeableDoc(doc)) : [];
+  const skippedWebClips = args.skipWebClips ? docs.filter((doc) => isLegacyUpgradeableDoc(doc) && isWebClipDoc(doc)) : [];
+  docs = docs.filter((doc) => isLegacyUpgradeableDoc(doc));
+  if (args.skipWebClips) docs = docs.filter((doc) => !isWebClipDoc(doc));
+
+  await fsp.mkdir(args.out, { recursive: true });
+  const manifestPath = path.join(args.out, "_wiz_upgrade_manifest.json");
+  const existingManifest = args.resume ? await loadManifest(manifestPath) : null;
+  const previousNotes = existingManifest && Array.isArray(existingManifest.notes) ? existingManifest.notes : [];
+  const previousSkipped = existingManifest && Array.isArray(existingManifest.skipped) ? existingManifest.skipped : [];
+  const previousByDoc = new Map(previousNotes
+    .filter((note) => note && note.docGuid)
+    .map((note) => [note.docGuid, note]));
+
+  const skippedForResume = [];
+  if (args.resume) {
+    const pending = [];
+    for (const doc of docs) {
+      const previous = previousByDoc.get(doc.docGuid);
+      if (previous && previous.ok && previous.toType === "lite/markdown") skippedForResume.push(doc);
+      else pending.push(doc);
+    }
+    docs = pending;
+  }
+  if (args.limit) docs = docs.slice(0, args.limit);
+
+  const manifest = {
+    generatedAt: new Date().toISOString(),
+    stage: args.dryRun ? "upgrade-legacy-dry-run" : "upgrade-legacy",
+    sourceProfile: args.profile,
+    outputDir: args.out,
+    status,
+    notes: previousNotes.slice(),
+    skipped: skippedByType.map((doc) => ({
+      docGuid: doc.docGuid,
+      kbGuid: doc.kbGuid,
+      title: doc.title || "",
+      category: doc.category || "",
+      type: doc.type || "",
+      reason: isCoEdit(doc.type) ? "collaboration-not-supported" : "unsupported-note-type",
+    })).concat(skippedWebClips.map((doc) => ({
+      docGuid: doc.docGuid,
+      kbGuid: doc.kbGuid,
+      title: doc.title || "",
+      category: doc.category || "",
+      type: doc.type || "",
+      url: doc.url || "",
+      reason: "web-clip",
+    }))),
+  };
+
+  const upsertNoteRecord = (noteRecord) => {
+    const index = manifest.notes.findIndex((note) => note.docGuid === noteRecord.docGuid);
+    if (index >= 0) manifest.notes[index] = noteRecord;
+    else manifest.notes.push(noteRecord);
+  };
+
+  if (args.resume && skippedForResume.length) {
+    log(args, `Resume: skipped ${skippedForResume.length} upgraded notes`);
+  }
+  log(args, `${args.dryRun ? "Dry-running" : "Upgrading"} ${docs.length} legacy notes`);
+
+  let current = 0;
+  while (current < docs.length) {
+    let restartBrowser = false;
+    await withBrowser(args, async (cdp) => {
+      while (current < docs.length && !restartBrowser) {
+        const displayIndex = current + 1;
+        const doc = docs[current];
+        const kb = indexes.kbsByGuid.get(doc.kbGuid) || {};
+        const expression = `window.__WIZ_EXPORT__.upgradeLegacyNote(${JSON.stringify({
+          note: doc,
+          kb,
+          dryRun: args.dryRun,
+          convertTimeoutMs: args.noteTimeoutMs,
+        })})`;
+        let result;
+        const timeoutMs = Math.max(args.noteTimeoutMs * 2 + 70000, 90000);
+        try {
+          result = await evaluateWithTimeout(cdp, expression, timeoutMs, `upgrade ${doc.docGuid}`);
+        } catch (err) {
+          result = {
+            ok: false,
+            source: isEvaluateTimeout(err) ? "timeout" : "error",
+            error: err && err.message ? err.message : String(err),
+            fromType: doc.type || "",
+          };
+          restartBrowser = true;
+        }
+
+        const noteRecord = makeUpgradeRecord(doc, result);
+        upsertNoteRecord(noteRecord);
+        await writeManifest(manifestPath, manifest);
+
+        if (!args.json) {
+          const statusText = noteRecord.ok
+            ? (noteRecord.skipped ? `skipped: ${noteRecord.reason}` : `resources ${noteRecord.resourceNames.length}`)
+            : `failed: ${noteRecord.error || noteRecord.reason || "unknown"}`;
+          console.log(`[${displayIndex}/${docs.length}] ${doc.title || doc.docGuid} ${statusText}`);
+        }
+        current += 1;
+      }
+    }, { includeResourceCache: false });
+  }
+
+  await writeManifest(manifestPath, manifest);
+  const summary = {
+    ok: manifest.notes.every((note) => note.ok || note.skipped),
+    dryRun: args.dryRun,
+    manifestPath,
+    selected: docs.length,
+    upgraded: manifest.notes.filter((note) => note.ok && !note.skipped && !note.dryRun).length,
+    dryRunConverted: manifest.notes.filter((note) => note.ok && !note.skipped && note.dryRun).length,
+    failed: manifest.notes.filter((note) => !note.ok && !note.skipped).length,
+    skipped: manifest.notes.filter((note) => note.skipped).length + manifest.skipped.length,
+    resourceUploadsRequested: manifest.notes.reduce((sum, note) => sum + (note.uploadResourcesRequested ? note.uploadResourcesRequested.length : 0), 0),
+    resourceUploadsFailed: manifest.notes.flatMap((note) => note.uploadedResources || []).filter((item) => !item.ok).length,
+  };
+  if (args.json) console.log(JSON.stringify(summary, null, 2));
+  else {
+    console.log(`\nDone. ${args.dryRun ? "Dry-run converted" : "Upgraded"}: ${args.dryRun ? summary.dryRunConverted : summary.upgraded}`);
+    if (summary.failed) console.log(`Failed: ${summary.failed}`);
+    if (summary.resourceUploadsRequested) console.log(`Requested resource uploads: ${summary.resourceUploadsRequested}`);
+    if (summary.resourceUploadsFailed) console.log(`Failed resource uploads: ${summary.resourceUploadsFailed}`);
+    console.log(`Manifest: ${manifestPath}`);
+  }
+}
+
 async function evaluateWithTimeout(cdp, expression, timeoutMs, label) {
   let timer = null;
   try {
@@ -2241,6 +2831,7 @@ async function runExport(args) {
     });
     if (args.coeditOnly) docs = docs.filter((doc) => isCoEdit(doc.type));
     if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
+    if (args.skipWebClips) docs = docs.filter((doc) => !isWebClipDoc(doc));
     blockedMissing = docs.filter((doc) => !noteHasLocalBody(doc, indexes) && !args.fetchMissing);
     if (!args.wait || !blockedMissing.length) break;
     log(args, `Selected note bodies are incomplete (${docs.length - blockedMissing.length}/${docs.length}). Waiting ${Math.round(args.pollMs / 1000)}s before retry...`);
@@ -2267,6 +2858,14 @@ async function runExport(args) {
   }
 
   const skippedForMissing = [];
+  const skippedForWebClips = [];
+  if (args.skipWebClips) {
+    const allSelectedDocs = sortDocsByTree(indexes.docs)
+      .filter((doc) => (!args.coeditOnly || isCoEdit(doc.type)) && (!args.only || doc.docGuid === args.only));
+    for (const doc of allSelectedDocs) {
+      if (isWebClipDoc(doc)) skippedForWebClips.push(doc);
+    }
+  }
   if (args.allowPartial) {
     const kept = [];
     for (const doc of docs) {
@@ -2287,10 +2886,15 @@ async function runExport(args) {
 
   let plans = noteOutputPlan(docs, args.out);
   const skippedForResume = [];
+  const skippedForPreviousFailure = [];
   if (args.resume) {
     const pending = [];
     for (const plan of plans) {
       const previous = previousByDoc.get(plan.doc.docGuid);
+      if (args.skipFailed && previous && !previous.ok) {
+        skippedForPreviousFailure.push(plan);
+        continue;
+      }
       const hasMarkdown = await pathExists(plan.filePath);
       const manifestFresh = hasMarkdown && previous && previous.ok && previous.updated === new Date(noteModifiedMs(plan.doc)).toISOString();
       const fileFresh = await isPlanFreshFromFile(plan);
@@ -2308,8 +2912,24 @@ async function runExport(args) {
     outputDir: args.out,
     status,
     notes: previousNotes.slice(),
-    skipped: [],
+    skipped: args.only ? previousSkipped.filter((item) => item && item.docGuid !== args.only) : [],
   };
+
+  let prunedSkippedWebClips = 0;
+  if (args.skipWebClips && skippedForWebClips.length && manifest.notes.length) {
+    const webClipGuids = new Set(skippedForWebClips.map((doc) => doc.docGuid));
+    const keptNotes = [];
+    for (const note of manifest.notes) {
+      if (!note || !webClipGuids.has(note.docGuid)) {
+        keptNotes.push(note);
+        continue;
+      }
+      await removeExportArtifact(args.out, note.markdownPath);
+      await removeExportArtifact(args.out, note.assetDir);
+      prunedSkippedWebClips += 1;
+    }
+    manifest.notes = keptNotes;
+  }
 
   for (const doc of skippedForMissing) {
     manifest.skipped.push({
@@ -2317,6 +2937,25 @@ async function runExport(args) {
       title: doc.title || "",
       category: doc.category || "",
       reason: "missing-local-body",
+    });
+  }
+  for (const doc of skippedForWebClips) {
+    manifest.skipped.push({
+      docGuid: doc.docGuid,
+      title: doc.title || "",
+      category: doc.category || "",
+      reason: "web-clip",
+      url: doc.url || "",
+    });
+  }
+  for (const plan of skippedForPreviousFailure) {
+    const previous = previousByDoc.get(plan.doc.docGuid) || {};
+    manifest.skipped.push({
+      docGuid: plan.doc.docGuid,
+      title: plan.doc.title || "",
+      category: plan.doc.category || "",
+      reason: "previous-failed",
+      error: previous.error || "",
     });
   }
 
@@ -2347,8 +2986,22 @@ async function runExport(args) {
     else manifest.notes.push(noteRecord);
   };
 
+  for (const plan of skippedForResume) {
+    const previous = previousByDoc.get(plan.doc.docGuid);
+    if (previous && previous.ok) continue;
+    const attachmentKey = `${plan.doc.kbGuid}\u0000${plan.doc.docGuid}`;
+    const attachments = indexes.attachmentsByDoc.get(attachmentKey) || [];
+    upsertNoteRecord(makeNoteRecord(plan, { ok: true, source: "resume-frontmatter" }, attachments));
+  }
+
   if (args.resume && skippedForResume.length) {
     log(args, `Resume: skipped ${skippedForResume.length} fresh notes`);
+  }
+  if (args.resume && skippedForPreviousFailure.length) {
+    log(args, `Resume: skipped ${skippedForPreviousFailure.length} previously failed notes`);
+  }
+  if (prunedSkippedWebClips) {
+    log(args, `Pruned ${prunedSkippedWebClips} stale web-clip exports`);
   }
   log(args, `Exporting ${plans.length} notes to ${args.out}`);
   let current = 0;
@@ -2384,7 +3037,7 @@ async function runExport(args) {
             restartBrowser = true;
             return;
           }
-          if (!isCoEdit(doc.type) && !plan.simpleHtmlAttempt) {
+          if (!isCoEdit(doc.type) && !args.simpleHtml && !plan.simpleHtmlAttempt) {
             plan.simpleHtmlAttempt = true;
             log(args, `[${displayIndex}/${plans.length}] retrying ${doc.title || doc.docGuid} with simple HTML converter after timeout`);
             restartBrowser = true;
@@ -2410,7 +3063,7 @@ async function runExport(args) {
 
         if (!result.ok) {
           noteRecord.error = result.error || (result.missingBody ? "missing-local-body" : "conversion-failed");
-          if (!isCoEdit(doc.type) && !plan.simpleHtmlAttempt && /timed out/i.test(noteRecord.error)) {
+          if (!isCoEdit(doc.type) && !args.simpleHtml && !plan.simpleHtmlAttempt && /timed out/i.test(noteRecord.error)) {
             plan.simpleHtmlAttempt = true;
             log(args, `[${displayIndex}/${plans.length}] retrying ${doc.title || doc.docGuid} with simple HTML converter after ${noteRecord.error}`);
             restartBrowser = true;
@@ -2491,6 +3144,7 @@ async function runExport(args) {
     attachments: manifest.notes.reduce((sum, note) => sum + (note.attachments ? note.attachments.length : 0), 0),
     attachmentsDownloaded: manifest.notes.flatMap((note) => note.attachments || []).filter((att) => att.ok && att.path).length,
     attachmentsMissing: manifest.notes.flatMap((note) => note.attachments || []).filter((att) => att.ok === false).length,
+    prunedSkippedWebClips,
   };
   if (args.json) console.log(JSON.stringify(summary, null, 2));
   else {
@@ -2514,6 +3168,7 @@ async function main() {
     if (!(await pathExists(args.liveEditor))) throw new Error(`LiveEditor bundle not found: ${args.liveEditor}`);
     if (args.command === "status") await runStatus(args);
     else if (args.command === "snapshot") await runSnapshot(args);
+    else if (args.command === "upgrade-legacy") await runUpgradeLegacy(args);
     else if (args.command === "export") await runExport(args);
   } catch (err) {
     if (args && args.json) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
