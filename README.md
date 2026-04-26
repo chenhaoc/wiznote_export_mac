@@ -11,7 +11,7 @@ Stage 1 exports:
 
 WizNote's "download all notes" setting is still required before a full export, but it should be understood as "download all note bodies". Attachments are separate objects and are not included in that offline setting. Body images/resources are mixed: some are already local, some are in the editor resource cache, and some need to be downloaded from WizNote's resource server during export.
 
-Stage 2 is intentionally left incremental: attachment download and Markdown attachment links will build on the manifest and note-path mapping produced by stage 1.
+Stage 2 adds collaboration-note file attachments: local Markdown file links such as `[office](...)` are rewritten into the note's `.assets/` directory and downloaded through the same authenticated resource path used for collaboration images.
 
 ## Commands
 
@@ -39,7 +39,13 @@ If the richer editor converter hangs on a complex legacy HTML note, the exporter
 Export only collaboration notes and skip legacy HTML notes:
 
 ```bash
-node scripts/wiz-export.js export --out ./export-coedit --coedit-only
+node scripts/wiz-export.js export --out ./export-coedit --coedit-only --attachments
+```
+
+Add attachments to an existing collaboration-note export without reconverting note bodies:
+
+```bash
+node scripts/wiz-export.js export --out ./export-coedit --attachments-only
 ```
 
 If WizNote is still syncing and you want to export only notes that already have local bodies:
@@ -53,6 +59,8 @@ Useful options:
 - `--wait`: wait until local note bodies look complete before exporting
 - `--fetch-missing`: download/sync missing note bodies during export instead of waiting for the client
 - `--coedit-only`: export only collaboration notes
+- `--attachments`: download collaboration-note file links and rewrite them into `.assets/`
+- `--attachments-only`: update an existing export directory with collaboration attachments only
 - `--note-timeout-ms N`: skip one problematic note after this timeout and restart the conversion browser
 - `--limit N`: export at most N notes, useful for verification
 - `--only DOC_GUID`: export one note
