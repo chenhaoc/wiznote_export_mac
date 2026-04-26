@@ -20,7 +20,7 @@ Stage 2 adds collaboration-note file attachments: local Markdown file links such
 
 The exporter now treats note-body Markdown as the migration target and does not export WizNote collaboration comments. In practice this means the main conversion path uses the same Markdown body/resource flow as before, but with comments disabled globally. This avoids known collaboration-note conversion crashes triggered by comment rendering while keeping note body images and file links intact.
 
-Because comments are intentionally excluded, `RTL DDR利用率` and similar notes no longer need a special degraded fallback. For ordinary full-batch exports, note-route "open note first" prewarm is not part of the default strategy anymore; it remains only as a diagnostic path for unusual collaboration-note failures.
+Because comments are intentionally excluded, `RTL DDR利用率` and similar notes no longer need a special degraded fallback. For ordinary full-batch exports, note-route "open note first" prewarm is not part of the default strategy anymore; it remains only as a diagnostic path for unusual collaboration-note failures. When a collaboration resource is still missing after IndexedDB, Cache API, editor cache, and server fetch attempts, the exporter now falls back to the original WizNote profile cache on disk and restores the resource file directly from there.
 
 ## Commands
 
@@ -94,6 +94,15 @@ Retry only notes that are currently recorded as failed in the manifest:
 node scripts/wiz-export.js export --out ./export-coedit --fetch-missing --attachments --resume --failed-only --skip-web-clips
 ```
 
+Quickly verify an export directory and optionally rebuild `_wiz_export_manifest.json`:
+
+```bash
+node scripts/wiz-export.js verify --out ./export-coedit
+node scripts/wiz-export.js verify --out ./export-coedit --rewrite-manifest
+```
+
+`verify` scans exported `.md` files, reads `wiznote_doc_guid` and `updated` from frontmatter, checks current note modified time against the live WizNote snapshot, and checks whether locally linked `.assets/` files still exist. It rebuilds a current-state manifest from those facts. It does not try to fully reconstruct historical converter provenance for every note; preserved `source` values come only from any existing manifest entries that still exist.
+
 If WizNote is still syncing and you want to export only notes that already have local bodies:
 
 ```bash
@@ -108,6 +117,7 @@ Useful options:
 - `--failed-only`: retry only notes already recorded as failed in `_wiz_export_manifest.json`
 - `--degraded-only`: retry only notes recorded as lossy plain-text fallbacks
 - `--coedit-only`: export only collaboration notes
+- `--rewrite-manifest`: with `verify`, rewrite `_wiz_export_manifest.json` from exported files
 - `--skip-failed`: with `--resume`, skip notes already recorded as failed in the manifest
 - `--skip-web-clips`: skip notes with a web clipping type or original `http(s)` URL; with `--resume`, stale exported `.md` and `.assets/` for those notes are pruned from the output directory
 - `--attachments`: download collaboration-note file links and rewrite them into `.assets/`
@@ -125,16 +135,28 @@ Useful options:
 
 ## Current Batch Status
 
-As of 2026-04-26, the main `export-coedit` batch state is:
+As of 2026-04-27, the main `export-coedit` batch state is:
 
 - exported successfully: `2258`
 - retryable failures: `0`
 - degraded exports: `0`
 - permanent failures: `1`
+- skipped web clips: `260`
+- missing body resources: `0`
+- missing attachments: `0`
+- orphan markdown files: `1`
+- duplicate docGuid markdown files: `0`
 
 Current permanent failure list:
 
 - `分段bitn压缩` (`43a9c683-9b71-4f3a-8b47-9029f3f6a4c5`): user-marked permanent failure; the note is abnormal and is no longer retried by `--failed-only`
+
+## Lessons Learned
+
+- WizNote collaboration-note images may already exist in the original Electron profile cache even when the temporary Chromium profile cannot read them back through `window.caches`.
+- A note opening normally in the WizNote UI proves the body is local, but it does not prove the exporter can see the same image cache through the copied browser profile.
+- For stubborn local-missing resources, treat the original profile's `Service Worker/CacheStorage` and Electron `Cache` directories as the final local fallback, ahead of declaring the resource permanently missing.
+- After any large retry or repair batch, run `verify --rewrite-manifest` so the manifest reflects the exported files on disk rather than historical retry state.
 
 ## Obsidian and SiYuan Notes
 

@@ -17,7 +17,7 @@ const DEFAULT_LIVE_EDITOR =
   "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js";
 const DEFAULT_OUT = path.resolve(process.cwd(), "export");
 
-const COMMANDS = new Set(["status", "snapshot", "export", "warm", "upgrade-legacy", "help"]);
+const COMMANDS = new Set(["status", "snapshot", "export", "warm", "verify", "upgrade-legacy", "help"]);
 
 function usage() {
   return `Usage:
@@ -25,6 +25,7 @@ function usage() {
   node scripts/wiz-export.js snapshot [--json] [--profile PATH]
   node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js warm --out DIR [--failed-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js verify --out DIR [--rewrite-manifest] [--coedit-only] [--only DOC_GUID]
   node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
 
 Options:
@@ -38,6 +39,7 @@ Options:
   --skip-failed      With --resume, keep previous failed notes in the manifest and skip retrying them
   --skip-web-clips   Skip notes imported/clipped from web pages
   --coedit-only      Export only collaboration notes and skip legacy HTML notes
+  --rewrite-manifest With verify, rewrite _wiz_export_manifest.json from exported files
   --attachments      Download collaboration-note file links and rewrite them into .assets/
   --attachments-only Update an existing export directory with body-link and legacy attachments
   --legacy-attachments-only
@@ -75,6 +77,7 @@ function parseArgs(argv) {
     skipFailed: false,
     skipWebClips: false,
     coeditOnly: false,
+    rewriteManifest: false,
     downloadAttachments: false,
     attachmentsOnly: false,
     legacyAttachmentsOnly: false,
@@ -104,6 +107,7 @@ function parseArgs(argv) {
     else if (a === "--skip-failed") args.skipFailed = true;
     else if (a === "--skip-web-clips") args.skipWebClips = true;
     else if (a === "--coedit-only") args.coeditOnly = true;
+    else if (a === "--rewrite-manifest") args.rewriteManifest = true;
     else if (a === "--attachments" || a === "--download-attachments") args.downloadAttachments = true;
     else if (a === "--attachments-only") {
       args.attachmentsOnly = true;
@@ -2049,21 +2053,62 @@ if (!window.__WIZ_EXPORT__) {
     if (extMatch) add(extMatch[1]);
     try { add(encodeURIComponent(resourceName)); } catch {}
     try { add(decodeURIComponent(resourceName)); } catch {}
-    let cache;
+    let cacheNames;
     try {
-      cache = await caches.open("wiz-note-resource");
+      cacheNames = await caches.keys();
     } catch (err) {
-      return { ok: false, reason: "cache-open-failed: " + err.message };
+      return { ok: false, reason: "cache-list-failed: " + err.message };
     }
-    for (const dataId of candidates) {
-      const url = "http://wiznote-desktop/note/resources/" + note.kbGuid + "/" + note.docGuid + "/" + dataId;
-      const response = await cache.match(url).catch(() => null);
-      if (response) {
+    const orderedCacheNames = Array.from(new Set(["wiz-note-resource"].concat(cacheNames || []))).filter(Boolean);
+    const candidateSet = new Set(candidates);
+    for (const cacheName of orderedCacheNames) {
+      let cache;
+      try {
+        cache = await caches.open(cacheName);
+      } catch {
+        continue;
+      }
+      for (const dataId of candidates) {
+        const urls = [
+          "http://wiznote-desktop/note/resources/" + note.kbGuid + "/" + note.docGuid + "/" + dataId,
+          "http://wiznote-desktop/resources/" + dataId,
+        ];
+        for (const url of urls) {
+          const response = await cache.match(url).catch(() => null);
+          if (!response) continue;
+          const buffer = await response.arrayBuffer();
+          return {
+            ok: true,
+            source: "cache-api:" + cacheName,
+            dataId,
+            cacheUrl: url,
+            base64: arrayBufferToBase64(buffer),
+            byteLength: buffer.byteLength,
+          };
+        }
+      }
+      const requests = await cache.keys().catch(() => []);
+      for (const request of requests) {
+        const url = request && request.url ? request.url : "";
+        if (!/\/resources\//i.test(url)) continue;
+        const names = [];
+        const pushName = (value) => {
+          if (value && !names.includes(value)) names.push(value);
+        };
+        const keyBase = basenameFromUrl(url);
+        pushName(keyBase);
+        const keyExtMatch = keyBase.match(/^(.*)\.[^.]{1,8}$/);
+        if (keyExtMatch) pushName(keyExtMatch[1]);
+        try { pushName(decodeURIComponent(keyBase)); } catch {}
+        if (!names.some((name) => candidateSet.has(name))) continue;
+        const response = await cache.match(request).catch(() => null);
+        if (!response) continue;
         const buffer = await response.arrayBuffer();
         return {
           ok: true,
-          source: "cache-api:wiz-note-resource",
-          dataId,
+          source: "cache-api:" + cacheName,
+          dataId: names.find((name) => candidateSet.has(name)) || keyBase,
+          cacheUrl: url,
           base64: arrayBufferToBase64(buffer),
           byteLength: buffer.byteLength,
         };
@@ -3225,6 +3270,164 @@ async function writeBase64File(filePath, base64) {
   await fsp.writeFile(filePath, Buffer.from(base64, "base64"));
 }
 
+const PROFILE_CACHE_LOOKUP = new Map();
+
+function profileCacheRoots(profilePath) {
+  return [
+    {
+      kind: "service-worker-cache-storage",
+      dir: path.join(profilePath, "Service Worker/CacheStorage"),
+    },
+    {
+      kind: "electron-cache",
+      dir: path.join(profilePath, "Cache"),
+    },
+  ];
+}
+
+async function findProfileCacheEntry(profilePath, resourceName) {
+  const key = `${profilePath}\u0000${resourceName}`;
+  if (PROFILE_CACHE_LOOKUP.has(key)) return PROFILE_CACHE_LOOKUP.get(key);
+
+  for (const root of profileCacheRoots(profilePath)) {
+    if (!(await pathExists(root.dir))) continue;
+    try {
+      const { stdout } = await execFileAsync("rg", [
+        "-a",
+        "-l",
+        "-m",
+        "1",
+        "--no-messages",
+        "--fixed-strings",
+        resourceName,
+        root.dir,
+      ], {
+        maxBuffer: 1024 * 1024 * 64,
+      });
+      const match = String(stdout || "").split(/\r?\n/).find(Boolean);
+      if (match) {
+        const found = { ok: true, kind: root.kind, cachePath: match };
+        PROFILE_CACHE_LOOKUP.set(key, found);
+        return found;
+      }
+    } catch (err) {
+      const stdout = err && err.stdout ? String(err.stdout) : "";
+      const match = stdout.split(/\r?\n/).find(Boolean);
+      if (match) {
+        const found = { ok: true, kind: root.kind, cachePath: match };
+        PROFILE_CACHE_LOOKUP.set(key, found);
+        return found;
+      }
+    }
+  }
+
+  const missing = { ok: false, reason: "not-found-in-profile-cache" };
+  PROFILE_CACHE_LOOKUP.set(key, missing);
+  return missing;
+}
+
+function findCachedPayloadOffset(buffer, fileName) {
+  const ext = path.extname(fileName || "").toLowerCase();
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const jpg = Buffer.from([0xff, 0xd8, 0xff]);
+  const gif87 = Buffer.from("GIF87a", "ascii");
+  const gif89 = Buffer.from("GIF89a", "ascii");
+  const zip = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+  const pdf = Buffer.from("%PDF-", "ascii");
+  const webpOffset = () => {
+    let index = buffer.indexOf("RIFF", 0, "ascii");
+    while (index >= 0) {
+      if (buffer.slice(index + 8, index + 12).equals(Buffer.from("WEBP", "ascii"))) return index;
+      index = buffer.indexOf("RIFF", index + 1, "ascii");
+    }
+    return -1;
+  };
+  const svgOffset = () => {
+    const xml = buffer.indexOf("<?xml", 0, "utf8");
+    const svg = buffer.indexOf("<svg", 0, "utf8");
+    if (xml >= 0 && svg >= 0) return Math.min(xml, svg);
+    return Math.max(xml, svg);
+  };
+
+  const detectors = [];
+  const add = (fn) => detectors.push(fn);
+  switch (ext) {
+    case ".png":
+      add(() => buffer.indexOf(png));
+      break;
+    case ".jpg":
+    case ".jpeg":
+      add(() => buffer.indexOf(jpg));
+      break;
+    case ".gif":
+      add(() => buffer.indexOf(gif87));
+      add(() => buffer.indexOf(gif89));
+      break;
+    case ".webp":
+      add(webpOffset);
+      break;
+    case ".svg":
+      add(svgOffset);
+      break;
+    case ".pdf":
+      add(() => buffer.indexOf(pdf));
+      break;
+    case ".zip":
+    case ".docx":
+    case ".xlsx":
+    case ".xlsm":
+    case ".pptx":
+      add(() => buffer.indexOf(zip));
+      break;
+  }
+
+  add(() => buffer.indexOf(png));
+  add(() => buffer.indexOf(jpg));
+  add(() => buffer.indexOf(gif87));
+  add(() => buffer.indexOf(gif89));
+  add(webpOffset);
+  add(svgOffset);
+  add(() => buffer.indexOf(pdf));
+  add(() => buffer.indexOf(zip));
+
+  for (const detect of detectors) {
+    const offset = detect();
+    if (Number.isInteger(offset) && offset >= 0) return offset;
+  }
+  return -1;
+}
+
+async function restoreFileFromProfileCache(profilePath, resourceName, outputPath) {
+  if (!profilePath || !resourceName || !outputPath) {
+    return { ok: false, reason: "invalid-profile-cache-restore-args" };
+  }
+  const found = await findProfileCacheEntry(profilePath, resourceName);
+  if (!found.ok) return found;
+
+  const buffer = await fsp.readFile(found.cachePath);
+  const offset = findCachedPayloadOffset(buffer, outputPath);
+  if (offset < 0) {
+    return {
+      ok: false,
+      reason: "cache-payload-signature-not-found",
+      cachePath: found.cachePath,
+      kind: found.kind,
+    };
+  }
+
+  await fsp.mkdir(path.dirname(outputPath), { recursive: true });
+  const payload = buffer.subarray(offset);
+  await fsp.writeFile(outputPath, payload);
+  return {
+    ok: true,
+    kind: found.kind,
+    cachePath: found.cachePath,
+    path: outputPath,
+    byteLength: payload.byteLength,
+    fetchSource: `profile-cache:${found.kind}`,
+  };
+}
+
 async function runStatus(args) {
   const snapshot = await readSnapshot(args);
   const status = statusFromSnapshot(snapshot);
@@ -3386,7 +3589,7 @@ async function runUpgradeLegacy(args) {
 
         const noteRecord = makeUpgradeRecord(doc, result);
         upsertNoteRecord(noteRecord);
-        await writeManifest(manifestPath, manifest);
+        await writeManifestMerged(manifestPath, manifest);
 
         if (!args.json) {
           const statusText = noteRecord.ok
@@ -3399,7 +3602,7 @@ async function runUpgradeLegacy(args) {
     }, { includeResourceCache: false });
   }
 
-  await writeManifest(manifestPath, manifest);
+  await writeManifestMerged(manifestPath, manifest);
   const summary = {
     ok: manifest.notes.every((note) => note.ok || note.skipped),
     dryRun: args.dryRun,
@@ -3508,9 +3711,397 @@ async function loadManifest(manifestPath) {
   }
 }
 
+async function acquirePathLock(lockPath, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 300000);
+  const pollMs = Math.max(50, Number(options.pollMs) || 200);
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      await fsp.mkdir(lockPath);
+      const ownerFile = path.join(lockPath, "owner.json");
+      const owner = {
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+      };
+      await fsp.writeFile(ownerFile, JSON.stringify(owner, null, 2), "utf8").catch(() => {});
+      return async () => {
+        await fsp.rm(lockPath, { recursive: true, force: true });
+      };
+    } catch (err) {
+      lastError = err;
+      if (!err || err.code !== "EEXIST") throw err;
+      await sleep(pollMs);
+    }
+  }
+  throw new Error(`Timed out waiting for manifest lock ${lockPath}${lastError ? `: ${lastError.message}` : ""}`);
+}
+
+async function withManifestLock(manifestPath, fn, options = {}) {
+  await fsp.mkdir(path.dirname(manifestPath), { recursive: true });
+  const release = await acquirePathLock(`${manifestPath}.lock`, options);
+  try {
+    return await fn();
+  } finally {
+    await release();
+  }
+}
+
+function mergeManifestRecordsByDocGuid(currentRecords, nextRecords) {
+  const byDoc = new Map();
+  for (const record of currentRecords || []) {
+    if (record && record.docGuid) byDoc.set(record.docGuid, record);
+  }
+  for (const record of nextRecords || []) {
+    if (record && record.docGuid) byDoc.set(record.docGuid, record);
+  }
+  return Array.from(byDoc.values());
+}
+
+function mergeManifestSkipped(currentSkipped, nextSkipped) {
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...(currentSkipped || []), ...(nextSkipped || [])]) {
+    if (!item) continue;
+    const key = JSON.stringify({
+      docGuid: item.docGuid || "",
+      reason: item.reason || "",
+      markdownPath: item.markdownPath || "",
+      url: item.url || "",
+    });
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function mergeManifestDiagnosticList(currentItems, nextItems) {
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...(currentItems || []), ...(nextItems || [])]) {
+    if (!item) continue;
+    const key = JSON.stringify(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function mergeManifestState(currentManifest, nextManifest) {
+  const current = currentManifest || {};
+  const next = nextManifest || {};
+  return {
+    ...current,
+    ...next,
+    notes: mergeManifestRecordsByDocGuid(current.notes, next.notes),
+    skipped: mergeManifestSkipped(current.skipped, next.skipped),
+    orphanFiles: mergeManifestDiagnosticList(current.orphanFiles, next.orphanFiles),
+    duplicateDocGuidFiles: mergeManifestDiagnosticList(current.duplicateDocGuidFiles, next.duplicateDocGuidFiles),
+  };
+}
+
 async function writeManifest(manifestPath, manifest) {
   await fsp.mkdir(path.dirname(manifestPath), { recursive: true });
   await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+}
+
+async function writeManifestMerged(manifestPath, manifest) {
+  await withManifestLock(manifestPath, async () => {
+    const current = await loadManifest(manifestPath);
+    const merged = mergeManifestState(current, manifest);
+    await writeManifest(manifestPath, merged);
+  });
+}
+
+function splitMarkdownFrontmatter(text) {
+  const match = String(text || "").match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!match) return { frontmatterText: "", body: String(text || "") };
+  return {
+    frontmatterText: match[1] || "",
+    body: String(text || "").slice(match[0].length),
+  };
+}
+
+async function walkMarkdownFiles(rootDir) {
+  const results = [];
+  async function visit(dir) {
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === ".obsidian") continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await visit(fullPath);
+        continue;
+      }
+      if (entry.isFile() && path.extname(entry.name).toLowerCase() === ".md") {
+        results.push(fullPath);
+      }
+    }
+  }
+  if (await pathExists(rootDir)) await visit(rootDir);
+  return results.sort((a, b) => a.localeCompare(b));
+}
+
+function collectExportedAssetLinks(markdown, assetDirName) {
+  const isPseudoLocalAssetRef = (fileName) => /^(progress|loading)$/i.test(String(fileName || "").trim());
+  const refs = [];
+  const seen = new Set();
+  const pattern = /(!?\[[^\]\n]*\]\()([^)\s]+)(\))/g;
+  let match = pattern.exec(String(markdown || ""));
+  while (match) {
+    const prefix = match[1] || "";
+    const href = match[2] || "";
+    const clean = cleanMarkdownHref(href);
+    const noSuffix = clean.split("#")[0].split("?")[0];
+    let decoded = noSuffix;
+    try {
+      decoded = decodeURIComponent(noSuffix);
+    } catch {}
+    if (decoded.startsWith(assetDirName + "/")) {
+      const fileName = decoded.slice(assetDirName.length + 1);
+      if (isPseudoLocalAssetRef(fileName)) {
+        match = pattern.exec(String(markdown || ""));
+        continue;
+      }
+      const kind = prefix.startsWith("!") ? "resource" : "attachment";
+      const key = `${kind}\u0000${fileName.toLowerCase()}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        refs.push({ kind, href: clean, fileName, resourceName: basenameFromUrl(fileName) });
+      }
+    }
+    match = pattern.exec(String(markdown || ""));
+  }
+  return refs;
+}
+
+async function readExportedMarkdownRecord(filePath, outDir) {
+  const text = await fsp.readFile(filePath, "utf8");
+  const stat = await fsp.stat(filePath);
+  const { frontmatterText, body } = splitMarkdownFrontmatter(text);
+  const docGuid = parseFrontmatterValue(frontmatterText, "wiznote_doc_guid");
+  const kbGuid = parseFrontmatterValue(frontmatterText, "wiznote_kb_guid");
+  const updatedText = parseFrontmatterValue(frontmatterText, "updated");
+  const updated = Date.parse(updatedText);
+  const relativePath = path.relative(outDir, filePath);
+  const assetDirName = `${path.basename(filePath, ".md")}.assets`;
+  const assetDirAbs = path.join(path.dirname(filePath), assetDirName);
+  const assetDirRel = path.relative(outDir, assetDirAbs);
+  const refs = collectExportedAssetLinks(body, assetDirName);
+  const resources = [];
+  const attachments = [];
+  for (const ref of refs) {
+    const absoluteRefPath = path.join(path.dirname(filePath), assetDirName, ref.fileName);
+    const ok = await pathExists(absoluteRefPath);
+    const relRefPath = path.relative(outDir, absoluteRefPath);
+    const record = {
+      source: ref.href,
+      resourceName: ref.resourceName,
+      fileName: ref.fileName,
+      kind: ref.kind,
+      ok,
+      reason: ok ? undefined : "missing-local-file",
+      fetchSource: ok ? "verify-local-link" : undefined,
+      path: ok ? relRefPath : undefined,
+    };
+    resources.push(record);
+    if (ref.kind === "attachment") {
+      attachments.push({
+        kind: "markdown-local-link",
+        name: ref.fileName,
+        resourceName: ref.resourceName,
+        ok,
+        path: ok ? relRefPath : undefined,
+        reason: ok ? undefined : "missing-local-file",
+        fetchSource: ok ? "verify-local-link" : undefined,
+      });
+    }
+  }
+  return {
+    docGuid,
+    kbGuid,
+    filePath,
+    relativePath,
+    assetDirRel,
+    updated: Number.isFinite(updated) ? updated : 0,
+    mtimeMs: stat.mtimeMs,
+    resources,
+    attachments,
+  };
+}
+
+async function scanExportedMarkdownMap(outDir) {
+  const files = await walkMarkdownFiles(outDir);
+  const byDocGuid = new Map();
+  const orphanFiles = [];
+  const duplicateDocGuidFiles = [];
+  for (const filePath of files) {
+    const record = await readExportedMarkdownRecord(filePath, outDir);
+    if (!record.docGuid) {
+      orphanFiles.push({
+        kind: "missing-doc-guid",
+        markdownPath: record.relativePath,
+      });
+      continue;
+    }
+    const existing = byDocGuid.get(record.docGuid);
+    if (!existing) {
+      byDocGuid.set(record.docGuid, record);
+      continue;
+    }
+    if (record.mtimeMs > existing.mtimeMs) {
+      duplicateDocGuidFiles.push({ docGuid: record.docGuid, markdownPath: existing.relativePath });
+      byDocGuid.set(record.docGuid, record);
+    } else {
+      duplicateDocGuidFiles.push({ docGuid: record.docGuid, markdownPath: record.relativePath });
+    }
+  }
+  return { byDocGuid, orphanFiles, duplicateDocGuidFiles };
+}
+
+function summarizeVerifyManifest(manifest) {
+  return {
+    ok: true,
+    manifestPath: path.join(manifest.outputDir, "_wiz_export_manifest.json"),
+    notesTotal: manifest.notes.length,
+    notesWritten: manifest.notes.filter((note) => note.ok).length,
+    notesFailed: manifest.notes.filter((note) => !note.ok && !note.permanentFailure).length,
+    permanentFailures: manifest.notes.filter((note) => note.permanentFailure).length,
+    degraded: manifest.notes.filter((note) => note.degraded).length,
+    resourcesMissing: manifest.notes.flatMap((note) => note.resources || []).filter((resource) => !resource.ok).length,
+    attachmentsMissing: manifest.notes.flatMap((note) => note.attachments || []).filter((att) => att.ok === false).length,
+    skipped: manifest.skipped.length,
+    orphanFiles: (manifest.orphanFiles || []).length,
+    duplicateDocGuidFiles: (manifest.duplicateDocGuidFiles || []).length,
+  };
+}
+
+async function runVerify(args) {
+  const snapshot = await readSnapshot(args);
+  const status = statusFromSnapshot(snapshot);
+  const indexes = buildIndexes(snapshot);
+  let docs = sortDocsByTree(indexes.docs);
+  if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
+  if (args.coeditOnly) docs = docs.filter((doc) => isCoEdit(doc.type));
+
+  await fsp.mkdir(args.out, { recursive: true });
+  const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
+  const existingManifest = await loadManifest(manifestPath);
+  const previousNotes = existingManifest && Array.isArray(existingManifest.notes) ? existingManifest.notes : [];
+  const previousByDoc = new Map(previousNotes.filter((note) => note && note.docGuid).map((note) => [note.docGuid, note]));
+  const scanned = await scanExportedMarkdownMap(args.out);
+
+  const notes = [];
+  const skipped = [];
+  for (const doc of docs) {
+    const previous = previousByDoc.get(doc.docGuid);
+    const exported = scanned.byDocGuid.get(doc.docGuid);
+    const modifiedMs = noteModifiedMs(doc);
+    if (exported) {
+      const stale = exported.updated ? exported.updated < modifiedMs : exported.mtimeMs < modifiedMs;
+      notes.push({
+        docGuid: doc.docGuid,
+        kbGuid: doc.kbGuid,
+        title: doc.title || "",
+        category: doc.category || "",
+        markdownPath: exported.relativePath,
+        assetDir: exported.assetDirRel,
+        source: previous && previous.source ? previous.source : "verify-frontmatter",
+        ok: !stale,
+        permanentFailure: false,
+        degraded: false,
+        error: stale ? "stale-export-file" : undefined,
+        updated: new Date(modifiedMs).toISOString(),
+        resources: exported.resources,
+        attachments: exported.attachments,
+      });
+      continue;
+    }
+    if (isWebClipDoc(doc)) {
+      skipped.push({
+        docGuid: doc.docGuid,
+        kbGuid: doc.kbGuid,
+        title: doc.title || "",
+        category: doc.category || "",
+        reason: "web-clip",
+        url: doc.url || "",
+      });
+      continue;
+    }
+    if (previous && previous.permanentFailure) {
+      notes.push({
+        docGuid: doc.docGuid,
+        kbGuid: doc.kbGuid,
+        title: doc.title || "",
+        category: doc.category || "",
+        markdownPath: previous.markdownPath || "",
+        assetDir: previous.assetDir || "",
+        source: previous.source || "verify-permanent-failure",
+        ok: false,
+        permanentFailure: true,
+        degraded: false,
+        error: previous.error || "permanent-failure",
+        updated: new Date(modifiedMs).toISOString(),
+        resources: previous.resources || [],
+        attachments: previous.attachments || [],
+      });
+      continue;
+    }
+    notes.push({
+      docGuid: doc.docGuid,
+      kbGuid: doc.kbGuid,
+      title: doc.title || "",
+      category: doc.category || "",
+      markdownPath: "",
+      assetDir: "",
+      source: "verify-missing-file",
+      ok: false,
+      permanentFailure: false,
+      degraded: false,
+      error: "missing-export-file",
+      updated: new Date(modifiedMs).toISOString(),
+      resources: [],
+      attachments: [],
+    });
+  }
+
+  const manifest = {
+    generatedAt: new Date().toISOString(),
+    stage: existingManifest && existingManifest.stage ? existingManifest.stage : "verified",
+    sourceProfile: args.profile,
+    outputDir: args.out,
+    status,
+    notes,
+    skipped,
+    orphanFiles: scanned.orphanFiles,
+    duplicateDocGuidFiles: scanned.duplicateDocGuidFiles,
+  };
+
+  if (args.rewriteManifest) {
+    await withManifestLock(manifestPath, async () => {
+      await writeManifest(manifestPath, manifest);
+    });
+  }
+
+  const summary = summarizeVerifyManifest(manifest);
+  summary.rewriteManifest = !!args.rewriteManifest;
+  if (args.json) {
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    console.log(`Verified ${summary.notesTotal} notes in ${args.out}`);
+    console.log(`OK: ${summary.notesWritten}`);
+    if (summary.notesFailed) console.log(`Retryable failures: ${summary.notesFailed}`);
+    if (summary.permanentFailures) console.log(`Permanent failures: ${summary.permanentFailures}`);
+    if (summary.resourcesMissing) console.log(`Missing local resources: ${summary.resourcesMissing}`);
+    if (summary.attachmentsMissing) console.log(`Missing local attachments: ${summary.attachmentsMissing}`);
+    if (summary.skipped) console.log(`Skipped: ${summary.skipped}`);
+    if (summary.orphanFiles) console.log(`Orphan markdown files: ${summary.orphanFiles}`);
+    if (summary.duplicateDocGuidFiles) console.log(`Duplicate docGuid markdown files: ${summary.duplicateDocGuidFiles}`);
+    if (args.rewriteManifest) console.log(`Manifest rewritten: ${summary.manifestPath}`);
+  }
+  return { summary, manifest };
 }
 
 async function runAttachmentsOnly(args) {
@@ -3759,18 +4350,18 @@ async function runAttachmentsOnly(args) {
           attachmentsMissing += legacyMissing;
         }
 
-        await writeManifest(manifestPath, manifest);
+        await writeManifestMerged(manifestPath, manifest);
         if (!args.json) {
           console.log(`[${i + 1}/${selected.length}] ${noteRecord.markdownPath}, attachments ${attachmentsDownloaded}/${attachmentsFound}`);
         }
         current += 1;
       }
-    }, { includeResourceCache: true });
+    }, { includeResourceCache: false });
   }
 
   manifest.stage = "stage-2-attachments";
   manifest.attachmentsUpdatedAt = new Date().toISOString();
-  await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  await writeManifestMerged(manifestPath, manifest);
 
   const summary = {
     ok: true,
@@ -4189,7 +4780,7 @@ async function runExport(args) {
           const noteRecord = makeNoteRecord(plan, result, attachments);
           noteRecord.error = result.error;
           upsertNoteRecord(noteRecord);
-          await writeManifest(manifestPath, manifest);
+          await writeManifestMerged(manifestPath, manifest);
           log(args, `[${displayIndex}/${plans.length}] skipped ${doc.title || doc.docGuid}: ${noteRecord.error}`);
           current += 1;
           restartBrowser = true;
@@ -4228,7 +4819,7 @@ async function runExport(args) {
             return;
           }
           upsertNoteRecord(noteRecord);
-          await writeManifest(manifestPath, manifest);
+          await writeManifestMerged(manifestPath, manifest);
           log(args, `[${displayIndex}/${plans.length}] skipped ${doc.title || doc.docGuid}: ${noteRecord.error}`);
           current += 1;
           continue;
@@ -4256,6 +4847,20 @@ async function runExport(args) {
             resourceRecord.path = path.relative(args.out, filePath);
           } else if (resource.path) {
             resourceRecord.path = path.relative(args.out, resource.path);
+          } else if (!resource.ok && resource.fileName) {
+            const filePath = path.join(plan.assetDir, resource.fileName);
+            const recovered = await restoreFileFromProfileCache(args.profile, resource.resourceName, filePath).catch((err) => ({
+              ok: false,
+              reason: err && err.message ? err.message : String(err),
+            }));
+            if (recovered && recovered.ok) {
+              resourceRecord.ok = true;
+              resourceRecord.reason = undefined;
+              resourceRecord.fetchSource = recovered.fetchSource;
+              resourceRecord.byteLength = recovered.byteLength || resourceRecord.byteLength;
+              resourceRecord.path = path.relative(args.out, recovered.path);
+              log(args, `[${displayIndex}/${plans.length}] recovered ${resource.kind || "resource"} from profile cache: ${resource.resourceName}`);
+            }
           }
           noteRecord.resources.push(resourceRecord);
           if (resourceRecord.kind === "attachment") {
@@ -4273,7 +4878,7 @@ async function runExport(args) {
         }
 
         upsertNoteRecord(noteRecord);
-        await writeManifest(manifestPath, manifest);
+        await writeManifestMerged(manifestPath, manifest);
         if (!args.json) {
           const missingResources = noteRecord.resources.filter((r) => !r.ok).length;
           const resourceText = noteRecord.resources.length
@@ -4285,7 +4890,7 @@ async function runExport(args) {
       }
     }, { includeResourceCache: true });
   }
-  await writeManifest(manifestPath, manifest);
+  await writeManifestMerged(manifestPath, manifest);
 
   const summary = {
     ok: true,
@@ -4323,6 +4928,7 @@ async function main() {
     if (args.command === "status") await runStatus(args);
     else if (args.command === "snapshot") await runSnapshot(args);
     else if (args.command === "warm") await runWarm(args);
+    else if (args.command === "verify") await runVerify(args);
     else if (args.command === "upgrade-legacy") await runUpgradeLegacy(args);
     else if (args.command === "export") await runExport(args);
   } catch (err) {
