@@ -17,18 +17,20 @@ const DEFAULT_LIVE_EDITOR =
   "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js";
 const DEFAULT_OUT = path.resolve(process.cwd(), "export");
 
-const COMMANDS = new Set(["status", "export", "help"]);
+const COMMANDS = new Set(["status", "snapshot", "export", "help"]);
 
 function usage() {
   return `Usage:
   node scripts/wiz-export.js status [--json] [--profile PATH]
-  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--coedit-only] [--attachments] [--attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js snapshot [--json] [--profile PATH]
+  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--coedit-only] [--attachments] [--attachments-only] [--limit N] [--only DOC_GUID]
 
 Options:
   --out DIR          Export output directory. Default: ./export
   --profile PATH     WizNote profile path. Default: ~/Library/Application Support/WizNote
   --allow-partial    Export notes with local bodies and skip missing ones
   --fetch-missing    Fetch/sync missing note bodies from WizNote server during export
+  --resume           Skip exported notes that are already fresh in the output directory
   --coedit-only      Export only collaboration notes and skip legacy HTML notes
   --attachments      Download collaboration-note file links and rewrite them into .assets/
   --attachments-only Update an existing export directory with collaboration attachments only
@@ -53,6 +55,7 @@ function parseArgs(argv) {
     liveEditor: DEFAULT_LIVE_EDITOR,
     allowPartial: false,
     fetchMissing: false,
+    resume: false,
     coeditOnly: false,
     downloadAttachments: false,
     attachmentsOnly: false,
@@ -73,6 +76,7 @@ function parseArgs(argv) {
     else if (a === "--live-editor") args.liveEditor = path.resolve(argv[++i]);
     else if (a === "--allow-partial") args.allowPartial = true;
     else if (a === "--fetch-missing") args.fetchMissing = true;
+    else if (a === "--resume" || a === "--skip-existing") args.resume = true;
     else if (a === "--coedit-only") args.coeditOnly = true;
     else if (a === "--attachments" || a === "--download-attachments") args.downloadAttachments = true;
     else if (a === "--attachments-only") {
@@ -729,6 +733,10 @@ if (!window.__WIZ_EXPORT__) {
     return String(type || "").toLowerCase().startsWith("collaboration");
   }
 
+  function isLiteMarkdown(type) {
+    return String(type || "").toLowerCase() === "lite/markdown";
+  }
+
   function isExternalResource(src) {
     const s = String(src || "").trim();
     return /^(https?:|file:|data:|blob:|about:|mailto:|wiz:|wiznote:)/i.test(s);
@@ -889,6 +897,18 @@ if (!window.__WIZ_EXPORT__) {
     return { html: "", source: "missing" };
   }
 
+  async function fetchLocalViewDocData(note) {
+    const url = "/ks/note/view/" + encodeURIComponent(note.kbGuid) + "/" + encodeURIComponent(note.docGuid) +
+      "/index.html?lang=zh-cn&readerType=common&canEdit=0&xssNoFrame=1";
+    try {
+      const response = await fetchWithTimeout(url, { credentials: "include" }, 15000);
+      if (!response.ok) return { html: "", source: "local-view-http-" + response.status };
+      return { html: await response.text(), source: "wiznote-local-view" };
+    } catch (err) {
+      return { html: "", source: "local-view-error:" + err.message };
+    }
+  }
+
   async function fetchRemoteDocData(note, kb) {
     if (!kb || !kb.kbServer) return { html: "", source: "remote-missing-kb-server" };
     const token = await getAccountToken();
@@ -1047,6 +1067,16 @@ if (!window.__WIZ_EXPORT__) {
     return text(doc.body).replace(/\n{3,}/g, "\n\n").trim() + "\n";
   }
 
+  function extractLiteMarkdown(html) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html || "", "text/html");
+    const pre = Array.from(doc.body ? doc.body.children : [])
+      .find((node) => node.tagName && node.tagName.toLowerCase() === "pre") ||
+      (doc.body ? doc.body.querySelector("pre") : null);
+    if (!pre) return "";
+    return pre.textContent.replace(/\r\n?/g, "\n").replace(/\n+$/g, "") + "\n";
+  }
+
   function createResourceCollector(assetDirName) {
     const refs = [];
     const byName = new Map();
@@ -1114,7 +1144,7 @@ if (!window.__WIZ_EXPORT__) {
   }
 
   function rewriteIndexFileLinks(markdown, collector, assetDirName) {
-    return String(markdown || "").replace(/(!?\[[^\]]*\]\()([^)\s]+index_files\/[^)\s]+)(\))/g, (_m, prefix, src, suffix) => {
+    return String(markdown || "").replace(/(!?\[[^\]]*\]\()([^)\s]*index_files\/[^)\s]+)(\))/g, (_m, prefix, src, suffix) => {
       const ref = collector.reserve(src);
       return prefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
     });
@@ -1410,11 +1440,16 @@ if (!window.__WIZ_EXPORT__) {
       } else {
         let htmlData = await getHtmlData(note);
         if (!htmlData.html && payload.fetchMissing) {
-          htmlData = await fetchRemoteDocData(note, kb);
+          htmlData = await fetchLocalViewDocData(note);
+          if (!htmlData.html) htmlData = await fetchRemoteDocData(note, kb);
         }
         source = htmlData.source;
         if (!htmlData.html) {
           missingBody = true;
+        } else if (isLiteMarkdown(note.type)) {
+          markdown = extractLiteMarkdown(htmlData.html);
+          if (markdown) source = source ? source + "-lite-markdown" : "lite-markdown";
+          else missingBody = true;
         } else if (!payload.simpleHtml && window.LiveEditor && window.LiveEditor.html2Doc && window.LiveEditor.doc2markdown) {
           const doc = await withTimeout(
             window.LiveEditor.html2Doc(htmlData.html, { convertFont: false, convertList: true }),
@@ -1533,6 +1568,10 @@ function isCoEdit(type) {
   return String(type || "").toLowerCase().startsWith("collaboration");
 }
 
+function isLiteMarkdown(type) {
+  return String(type || "").toLowerCase() === "lite/markdown";
+}
+
 function dataKey(kbGuid, docGuid, dataId) {
   return `${kbGuid}\u0000${docGuid}\u0000${dataId}`;
 }
@@ -1588,10 +1627,11 @@ function statusFromSnapshot(snapshot) {
   const missing = [];
   const bodyBreakdown = {
     collaboration: { total: 0, present: 0, missing: 0 },
+    liteMarkdown: { total: 0, present: 0, missing: 0 },
     standardHtml: { total: 0, present: 0, missing: 0 },
   };
   for (const doc of indexes.docs) {
-    const kind = isCoEdit(doc.type) ? "collaboration" : "standardHtml";
+    const kind = isCoEdit(doc.type) ? "collaboration" : (isLiteMarkdown(doc.type) ? "liteMarkdown" : "standardHtml");
     const present = noteHasLocalBody(doc, indexes);
     bodyBreakdown[kind].total += 1;
     if (present) bodyBreakdown[kind].present += 1;
@@ -1653,8 +1693,10 @@ function printStatus(status) {
   console.log(`Local note bodies: ${status.localBodies.present}/${status.docsTotal}`);
   if (status.localBodies.byKind) {
     const co = status.localBodies.byKind.collaboration;
+    const lite = status.localBodies.byKind.liteMarkdown;
     const html = status.localBodies.byKind.standardHtml;
     console.log(`  collaboration: ${co.present}/${co.total}`);
+    console.log(`  lite markdown: ${lite.present}/${lite.total}`);
     console.log(`  standard HTML: ${html.present}/${html.total}`);
   }
   if (!status.localBodies.ready) {
@@ -1855,7 +1897,7 @@ function frontmatter(doc, attachments, bodyAttachments = []) {
   lines.push(`wiznote_category: ${yamlString(doc.category || "")}`);
   lines.push(`wiznote_type: ${yamlString(doc.type || "")}`);
   const created = isoTime(doc.created);
-  const updated = isoTime(doc.dataModified || doc.infoModified);
+  const updated = isoTime(noteModifiedMs(doc));
   if (created) lines.push(`created: ${yamlString(created)}`);
   if (updated) lines.push(`updated: ${yamlString(updated)}`);
   const tags = tagsFromDoc(doc);
@@ -1909,6 +1951,18 @@ async function runStatus(args) {
   return status;
 }
 
+async function runSnapshot(args) {
+  const snapshot = await readSnapshot(args);
+  if (args.json) console.log(JSON.stringify(snapshot, null, 2));
+  else {
+    console.log(`WizNote DB: ${snapshot.userDbName}`);
+    console.log(`Notes: ${snapshot.docs.length}`);
+    console.log(`Data rows: ${snapshot.dataIndex.length}`);
+    console.log(`Editor doc keys: ${snapshot.editorDocKeys.length}`);
+  }
+  return snapshot;
+}
+
 async function waitUntilReady(args) {
   for (;;) {
     const status = await runStatus({ ...args, json: false });
@@ -1948,6 +2002,57 @@ function upsertByResourceName(items, record) {
   const index = items.findIndex((item) => item.resourceName === record.resourceName && (item.kind || "resource") === (record.kind || "resource"));
   if (index >= 0) items[index] = record;
   else items.push(record);
+}
+
+function noteModifiedMs(doc) {
+  return Math.max(Number(doc.dataModified) || 0, Number(doc.infoModified) || 0);
+}
+
+function parseFrontmatterValue(text, key) {
+  const match = String(text || "").match(new RegExp("^" + key + ":\\s*(.*)$", "m"));
+  if (!match) return "";
+  return match[1].trim().replace(/^["']|["']$/g, "");
+}
+
+async function readExportedMarkdownMeta(filePath) {
+  try {
+    const text = await fsp.readFile(filePath, "utf8");
+    if (!text.startsWith("---\n")) return null;
+    const end = text.indexOf("\n---", 4);
+    if (end < 0) return null;
+    const frontmatterText = text.slice(4, end);
+    const updated = Date.parse(parseFrontmatterValue(frontmatterText, "updated"));
+    return {
+      docGuid: parseFrontmatterValue(frontmatterText, "wiznote_doc_guid"),
+      updated: Number.isFinite(updated) ? updated : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function isPlanFreshFromFile(plan) {
+  if (!(await pathExists(plan.filePath))) return false;
+  const meta = await readExportedMarkdownMeta(plan.filePath);
+  const modified = noteModifiedMs(plan.doc);
+  if (meta && meta.docGuid === plan.doc.docGuid && meta.updated) {
+    return meta.updated >= modified;
+  }
+  const stat = await fsp.stat(plan.filePath).catch(() => null);
+  return !!(stat && stat.mtimeMs >= modified);
+}
+
+async function loadManifest(manifestPath) {
+  try {
+    return JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeManifest(manifestPath, manifest) {
+  await fsp.mkdir(path.dirname(manifestPath), { recursive: true });
+  await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
 }
 
 async function runAttachmentsOnly(args) {
@@ -2136,7 +2241,6 @@ async function runExport(args) {
     });
     if (args.coeditOnly) docs = docs.filter((doc) => isCoEdit(doc.type));
     if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
-    if (args.limit) docs = docs.slice(0, args.limit);
     blockedMissing = docs.filter((doc) => !noteHasLocalBody(doc, indexes) && !args.fetchMissing);
     if (!args.wait || !blockedMissing.length) break;
     log(args, `Selected note bodies are incomplete (${docs.length - blockedMissing.length}/${docs.length}). Waiting ${Math.round(args.pollMs / 1000)}s before retry...`);
@@ -2174,14 +2278,36 @@ async function runExport(args) {
   }
 
   await fsp.mkdir(args.out, { recursive: true });
-  const plans = noteOutputPlan(docs, args.out);
+  const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
+  const existingManifest = args.resume ? await loadManifest(manifestPath) : null;
+  const previousNotes = existingManifest && Array.isArray(existingManifest.notes) ? existingManifest.notes : [];
+  const previousByDoc = new Map(previousNotes
+    .filter((note) => note && note.docGuid)
+    .map((note) => [note.docGuid, note]));
+
+  let plans = noteOutputPlan(docs, args.out);
+  const skippedForResume = [];
+  if (args.resume) {
+    const pending = [];
+    for (const plan of plans) {
+      const previous = previousByDoc.get(plan.doc.docGuid);
+      const hasMarkdown = await pathExists(plan.filePath);
+      const manifestFresh = hasMarkdown && previous && previous.ok && previous.updated === new Date(noteModifiedMs(plan.doc)).toISOString();
+      const fileFresh = await isPlanFreshFromFile(plan);
+      if (manifestFresh || fileFresh) skippedForResume.push(plan);
+      else pending.push(plan);
+    }
+    plans = pending;
+  }
+  if (args.limit) plans = plans.slice(0, args.limit);
+
   const manifest = {
     generatedAt: new Date().toISOString(),
     stage: args.downloadAttachments ? "stage-2-coedit-attachments" : "stage-1-no-attachments",
     sourceProfile: args.profile,
     outputDir: args.out,
     status,
-    notes: [],
+    notes: previousNotes.slice(),
     skipped: [],
   };
 
@@ -2203,6 +2329,7 @@ async function runExport(args) {
     assetDir: path.relative(args.out, plan.assetDir),
     source: result.source,
     ok: !!result.ok,
+    updated: new Date(noteModifiedMs(plan.doc)).toISOString(),
     resources: [],
     attachments: attachments.map((att) => ({
       kind: "legacy-indexeddb",
@@ -2214,6 +2341,15 @@ async function runExport(args) {
     })),
   });
 
+  const upsertNoteRecord = (noteRecord) => {
+    const index = manifest.notes.findIndex((note) => note.docGuid === noteRecord.docGuid);
+    if (index >= 0) manifest.notes[index] = noteRecord;
+    else manifest.notes.push(noteRecord);
+  };
+
+  if (args.resume && skippedForResume.length) {
+    log(args, `Resume: skipped ${skippedForResume.length} fresh notes`);
+  }
   log(args, `Exporting ${plans.length} notes to ${args.out}`);
   let current = 0;
   while (current < plans.length) {
@@ -2262,7 +2398,8 @@ async function runExport(args) {
           };
           const noteRecord = makeNoteRecord(plan, result, attachments);
           noteRecord.error = result.error;
-          manifest.notes.push(noteRecord);
+          upsertNoteRecord(noteRecord);
+          await writeManifest(manifestPath, manifest);
           log(args, `[${displayIndex}/${plans.length}] skipped ${doc.title || doc.docGuid}: ${noteRecord.error}`);
           current += 1;
           restartBrowser = true;
@@ -2285,7 +2422,8 @@ async function runExport(args) {
             restartBrowser = true;
             return;
           }
-          manifest.notes.push(noteRecord);
+          upsertNoteRecord(noteRecord);
+          await writeManifest(manifestPath, manifest);
           log(args, `[${displayIndex}/${plans.length}] skipped ${doc.title || doc.docGuid}: ${noteRecord.error}`);
           current += 1;
           continue;
@@ -2327,7 +2465,8 @@ async function runExport(args) {
           }
         }
 
-        manifest.notes.push(noteRecord);
+        upsertNoteRecord(noteRecord);
+        await writeManifest(manifestPath, manifest);
         if (!args.json) {
           const missingResources = noteRecord.resources.filter((r) => !r.ok).length;
           const resourceText = noteRecord.resources.length
@@ -2339,9 +2478,7 @@ async function runExport(args) {
       }
     }, { includeResourceCache: true });
   }
-
-  const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
-  await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  await writeManifest(manifestPath, manifest);
 
   const summary = {
     ok: true,
@@ -2376,6 +2513,7 @@ async function main() {
     if (!(await pathExists(args.profile))) throw new Error(`WizNote profile not found: ${args.profile}`);
     if (!(await pathExists(args.liveEditor))) throw new Error(`LiveEditor bundle not found: ${args.liveEditor}`);
     if (args.command === "status") await runStatus(args);
+    else if (args.command === "snapshot") await runSnapshot(args);
     else if (args.command === "export") await runExport(args);
   } catch (err) {
     if (args && args.json) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
