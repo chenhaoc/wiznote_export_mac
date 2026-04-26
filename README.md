@@ -37,6 +37,7 @@ node scripts/wiz-export.js export --out ./export --fetch-missing
 
 This bypass does not write anything back into the WizNote client database. It is intended to speed up migration for notes whose bodies have not arrived locally yet. The exporter asks the WizNote server first; keep the real WizNote desktop app open only when you want the local view server fallback available for unusual notes.
 If the richer editor converter hangs on a complex legacy HTML note, the exporter restarts its temporary browser and retries that note with a simpler HTML converter.
+For collaboration notes, plain-text fallback is treated as a degraded failed export, not a successful migration, because it can lose tables, images, and other structured blocks.
 
 Upgrade legacy ordinary notes before a full export:
 
@@ -67,10 +68,23 @@ Export only collaboration notes and skip legacy HTML notes:
 node scripts/wiz-export.js export --out ./export-coedit --coedit-only --attachments
 ```
 
-Add attachments to an existing collaboration-note export without reconverting note bodies:
+Add attachments to an existing export without reconverting note bodies. This downloads collaboration body links and legacy ordinary-note attachments into each note's `.assets/` directory:
 
 ```bash
 node scripts/wiz-export.js export --out ./export-coedit --attachments-only
+```
+
+When one attachment class is slow, process it separately:
+
+```bash
+node scripts/wiz-export.js export --out ./export-coedit --legacy-attachments-only
+node scripts/wiz-export.js export --out ./export-coedit --body-attachments-only
+```
+
+Retry only notes that are currently recorded as failed in the manifest:
+
+```bash
+node scripts/wiz-export.js export --out ./export-coedit --fetch-missing --attachments --resume --failed-only --skip-web-clips
 ```
 
 If WizNote is still syncing and you want to export only notes that already have local bodies:
@@ -84,13 +98,18 @@ Useful options:
 - `--wait`: wait until local note bodies look complete before exporting
 - `--fetch-missing`: download/sync missing note bodies during export instead of waiting for the client
 - `--resume`: skip exported notes whose Markdown is already fresh; `--skip-existing` is an alias
+- `--failed-only`: retry only notes already recorded as failed in `_wiz_export_manifest.json`
+- `--degraded-only`: retry only notes recorded as lossy plain-text fallbacks
 - `--coedit-only`: export only collaboration notes
 - `--skip-failed`: with `--resume`, skip notes already recorded as failed in the manifest
 - `--skip-web-clips`: skip notes with a web clipping type or original `http(s)` URL; with `--resume`, stale exported `.md` and `.assets/` for those notes are pruned from the output directory
 - `--attachments`: download collaboration-note file links and rewrite them into `.assets/`
-- `--attachments-only`: update an existing export directory with collaboration attachments only
+- `--attachments-only`: update an existing export directory with collaboration body-link attachments and legacy ordinary-note attachments
+- `--legacy-attachments-only`: update only legacy ordinary-note attachments in an existing export
+- `--body-attachments-only`: update only collaboration body-link attachments in an existing export
 - `--dry-run`: for `upgrade-legacy`, convert and report without uploading changes
 - `--note-timeout-ms N`: skip one problematic note after this timeout and restart the conversion browser
+- `--attachment-timeout-ms N`: per attachment/resource download timeout
 - `--limit N`: export at most N notes, useful for verification
 - `--only DOC_GUID`: export one note
 - `--json`: print machine-readable status/export summary

@@ -23,7 +23,7 @@ function usage() {
   return `Usage:
   node scripts/wiz-export.js status [--json] [--profile PATH]
   node scripts/wiz-export.js snapshot [--json] [--profile PATH]
-  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
 
 Options:
@@ -32,17 +32,25 @@ Options:
   --allow-partial    Export notes with local bodies and skip missing ones
   --fetch-missing    Fetch/sync missing note bodies from WizNote server during export
   --resume           Skip exported notes that are already fresh in the output directory
+  --failed-only      Retry only notes recorded as failed in the export manifest
+  --degraded-only    Retry only notes recorded as lossy plain-text fallbacks
   --skip-failed      With --resume, keep previous failed notes in the manifest and skip retrying them
   --skip-web-clips   Skip notes imported/clipped from web pages
   --coedit-only      Export only collaboration notes and skip legacy HTML notes
   --attachments      Download collaboration-note file links and rewrite them into .assets/
-  --attachments-only Update an existing export directory with collaboration attachments only
+  --attachments-only Update an existing export directory with body-link and legacy attachments
+  --legacy-attachments-only
+                     With --attachments-only, update only legacy ordinary-note attachments
+  --body-attachments-only
+                     With --attachments-only, update only collaboration body-link attachments
   --dry-run          Convert legacy notes and report what would be uploaded without writing to WizNote
   --simple-html      Use a faster, lower-fidelity converter for standard HTML notes
   --wait             Poll until local note bodies look complete
   --poll-ms N        Poll interval for --wait. Default: 60000
   --note-timeout-ms N
                      Timeout for one note conversion. Default: 90000
+  --attachment-timeout-ms N
+                     Timeout for one attachment/resource download. Default: 120000
   --limit N          Export at most N notes
   --only DOC_GUID    Export one note by docGuid
   --json             Print JSON
@@ -60,16 +68,21 @@ function parseArgs(argv) {
     allowPartial: false,
     fetchMissing: false,
     resume: false,
+    failedOnly: false,
+    degradedOnly: false,
     skipFailed: false,
     skipWebClips: false,
     coeditOnly: false,
     downloadAttachments: false,
     attachmentsOnly: false,
+    legacyAttachmentsOnly: false,
+    bodyAttachmentsOnly: false,
     dryRun: false,
     simpleHtml: false,
     wait: false,
     pollMs: 60000,
     noteTimeoutMs: 90000,
+    attachmentTimeoutMs: 120000,
     json: false,
     keepTemp: false,
     limit: null,
@@ -84,11 +97,23 @@ function parseArgs(argv) {
     else if (a === "--allow-partial") args.allowPartial = true;
     else if (a === "--fetch-missing") args.fetchMissing = true;
     else if (a === "--resume" || a === "--skip-existing") args.resume = true;
+    else if (a === "--failed-only") args.failedOnly = true;
+    else if (a === "--degraded-only") args.degradedOnly = true;
     else if (a === "--skip-failed") args.skipFailed = true;
     else if (a === "--skip-web-clips") args.skipWebClips = true;
     else if (a === "--coedit-only") args.coeditOnly = true;
     else if (a === "--attachments" || a === "--download-attachments") args.downloadAttachments = true;
     else if (a === "--attachments-only") {
+      args.attachmentsOnly = true;
+      args.downloadAttachments = true;
+    }
+    else if (a === "--legacy-attachments-only") {
+      args.legacyAttachmentsOnly = true;
+      args.attachmentsOnly = true;
+      args.downloadAttachments = true;
+    }
+    else if (a === "--body-attachments-only") {
+      args.bodyAttachmentsOnly = true;
       args.attachmentsOnly = true;
       args.downloadAttachments = true;
     }
@@ -101,6 +126,7 @@ function parseArgs(argv) {
     else if (a === "--only") args.only = argv[++i];
     else if (a === "--poll-ms") args.pollMs = Number(argv[++i]);
     else if (a === "--note-timeout-ms") args.noteTimeoutMs = Number(argv[++i]);
+    else if (a === "--attachment-timeout-ms") args.attachmentTimeoutMs = Number(argv[++i]);
     else if (a === "--help" || a === "-h") args.command = "help";
     else throw new Error(`Unknown option: ${a}`);
   }
@@ -113,6 +139,12 @@ function parseArgs(argv) {
   }
   if (!Number.isFinite(args.noteTimeoutMs) || args.noteTimeoutMs < 5000) {
     throw new Error("--note-timeout-ms must be at least 5000");
+  }
+  if (!Number.isFinite(args.attachmentTimeoutMs) || args.attachmentTimeoutMs < 5000) {
+    throw new Error("--attachment-timeout-ms must be at least 5000");
+  }
+  if (args.legacyAttachmentsOnly && args.bodyAttachmentsOnly) {
+    throw new Error("--legacy-attachments-only and --body-attachments-only cannot be used together");
   }
   return args;
 }
@@ -397,7 +429,7 @@ class CdpClient {
 async function waitForPageWebSocket(debugPort) {
   const started = Date.now();
   let lastError = null;
-  while (Date.now() - started < 20000) {
+  while (Date.now() - started < 45000) {
     try {
       const pages = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
       const page = pages.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
@@ -1593,7 +1625,7 @@ if (!window.__WIZ_EXPORT__) {
 
   async function fetchCoEditResource(note, kb, resourceName, meta, options = {}) {
     if (!kb || !kb.kbServer) return { ok: false, reason: "missing-kb-server" };
-    const timeoutMs = options.kind === "attachment" ? 60000 : 5000;
+    const timeoutMs = options.timeoutMs || (options.kind === "attachment" ? 60000 : 5000);
     const candidates = [];
     const add = (value) => {
       if (value && !candidates.includes(value)) candidates.push(value);
@@ -1647,7 +1679,10 @@ if (!window.__WIZ_EXPORT__) {
     }
     if (!result.ok) {
       result = isCoEdit(note.type)
-        ? await fetchCoEditResource(note, kb, ref.resourceName, meta, { kind: ref.kind || "resource" })
+        ? await fetchCoEditResource(note, kb, ref.resourceName, meta, {
+          kind: ref.kind || "resource",
+          timeoutMs: ref.timeoutMs,
+        })
         : await fetchNormalResource(note, kb, ref.resourceName);
     }
     return {
@@ -1792,6 +1827,7 @@ if (!window.__WIZ_EXPORT__) {
     await installLiveEditor();
     const { note, kb, assetDirName } = payload;
     const collector = createResourceCollector(assetDirName);
+    const convertTimeoutMs = Math.max(5000, Number(payload.convertTimeoutMs) || 30000);
     let markdown = "";
     let source = "";
     let missingBody = false;
@@ -1842,7 +1878,7 @@ if (!window.__WIZ_EXPORT__) {
                 keepComments: true,
                 buildResourceUrl: collector.buildResourceUrl,
               }),
-              30000,
+              convertTimeoutMs,
               "doc2markdown"
             );
           }
@@ -1863,7 +1899,7 @@ if (!window.__WIZ_EXPORT__) {
         } else if (!payload.simpleHtml && window.LiveEditor && window.LiveEditor.html2Doc && window.LiveEditor.doc2markdown) {
           const doc = await withTimeout(
             window.LiveEditor.html2Doc(htmlData.html, { convertFont: false, convertList: true }),
-            30000,
+            convertTimeoutMs,
             "html2Doc"
           );
           markdown = await withTimeout(
@@ -1872,7 +1908,7 @@ if (!window.__WIZ_EXPORT__) {
               keepComments: true,
               buildResourceUrl: collector.buildResourceUrl,
             }),
-            30000,
+            convertTimeoutMs,
             "doc2markdown"
           );
         } else {
@@ -1891,11 +1927,14 @@ if (!window.__WIZ_EXPORT__) {
       const resources = await mapLimit(collector.refs, payload.resourceConcurrency || 6, (ref) =>
         fillResourceData(note, kb, ref, coEditMeta)
       );
+      const lossyPlainTextFallback = /-plain-text$/.test(source);
 
       return {
-        ok: !missingBody,
+        ok: !missingBody && !lossyPlainTextFallback,
         missingBody,
         source,
+        degraded: lossyPlainTextFallback,
+        error: lossyPlainTextFallback ? "lossy-plain-text-fallback" : undefined,
         markdown,
         resources,
       };
@@ -1913,11 +1952,82 @@ if (!window.__WIZ_EXPORT__) {
 
   async function fetchResources(payload) {
     const { note, kb, refs } = payload;
-    const out = [];
-    for (const ref of refs || []) {
-      out.push(await fillResourceData(note, kb, ref, null));
+    return mapLimit(refs || [], payload.attachmentConcurrency || 3, (ref) =>
+      fillResourceData(note, kb, {
+        ...ref,
+        timeoutMs: payload.attachmentTimeoutMs,
+      }, null)
+    );
+  }
+
+  async function fetchLegacyAttachment(note, kb, attachment, options = {}) {
+    if (!kb || !kb.kbServer) return { ok: false, reason: "missing-kb-server" };
+    const token = await getAccountToken();
+    if (!token) return { ok: false, reason: "missing-account-token" };
+    const attGuid = attachment.attGuid || attachment.resourceName;
+    const timeoutMs = options.timeoutMs || 120000;
+    const candidates = [
+      {
+        kind: "object-objId",
+        url: kb.kbServer + "/ks/object/download/" + note.kbGuid + "/" + note.docGuid + "?objType=attachment&objId=" + encodeURIComponent(attGuid),
+      },
+      {
+        kind: "attachment-download",
+        url: kb.kbServer + "/ks/attachment/download/" + note.kbGuid + "/" + note.docGuid + "/" + encodeURIComponent(attGuid),
+      },
+      {
+        kind: "object-objGuid",
+        url: kb.kbServer + "/ks/object/download/" + note.kbGuid + "/" + note.docGuid + "?objType=attachment&objGuid=" + encodeURIComponent(attGuid),
+      },
+    ];
+    let lastReason = "not-on-server";
+    for (const candidate of candidates) {
+      try {
+        const response = await fetchWithTimeout("/__wiz_export_proxy?url=" + encodeURIComponent(candidate.url), {
+          headers: {
+            "x-wiz-token": token,
+            "x-wiz-proxy-timeout-ms": String(timeoutMs + 5000),
+          },
+        }, timeoutMs);
+        if (!response.ok) {
+          lastReason = "remote-http-" + response.status;
+          continue;
+        }
+        const buffer = await response.arrayBuffer();
+        if (!buffer.byteLength) {
+          lastReason = "empty-response";
+          continue;
+        }
+        return {
+          ok: true,
+          source: "wiznote-server-attachment:" + candidate.kind,
+          attGuid,
+          base64: arrayBufferToBase64(buffer),
+          byteLength: buffer.byteLength,
+        };
+      } catch (err) {
+        lastReason = err && err.message ? err.message : String(err);
+      }
     }
-    return out;
+    return { ok: false, source: "wiznote-server-attachment", attGuid, reason: lastReason };
+  }
+
+  async function fetchLegacyAttachments(payload) {
+    const { note, kb, attachments } = payload;
+    return mapLimit(attachments || [], payload.attachmentConcurrency || 2, async (attachment) => {
+      const result = await fetchLegacyAttachment(note, kb, attachment, {
+        timeoutMs: payload.attachmentTimeoutMs,
+      });
+      return {
+        ...attachment,
+        ...result,
+        kind: "legacy-indexeddb",
+        fileName: attachment.fileName,
+        name: attachment.name,
+        resourceName: attachment.attGuid,
+        fetchSource: result.source,
+      };
+    });
   }
 
   helper.installLiveEditor = installLiveEditor;
@@ -1930,6 +2040,7 @@ if (!window.__WIZ_EXPORT__) {
   helper.convertNote = convertNote;
   helper.upgradeLegacyNote = upgradeLegacyNote;
   helper.fetchResources = fetchResources;
+  helper.fetchLegacyAttachments = fetchLegacyAttachments;
   window.__WIZ_EXPORT__ = helper;
 }
 `;
@@ -2236,6 +2347,17 @@ function isLikelyLocalAttachmentHref(href, assetDirName) {
   return !/^md(?:own)?$/i.test(ext[1]);
 }
 
+const LEGACY_ATTACHMENT_SECTION_START = "<!-- wiznote-legacy-attachments:start -->";
+const LEGACY_ATTACHMENT_SECTION_END = "<!-- wiznote-legacy-attachments:end -->";
+
+function legacyAttachmentSectionRegExp() {
+  return new RegExp(
+    "\\n*" + LEGACY_ATTACHMENT_SECTION_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[\\s\\S]*?" +
+    LEGACY_ATTACHMENT_SECTION_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\n*",
+    "g"
+  );
+}
+
 function collectLocalAttachmentLinks(markdown, assetDirName) {
   const refs = [];
   const byName = new Map();
@@ -2265,7 +2387,7 @@ function collectLocalAttachmentLinks(markdown, assetDirName) {
     return ref;
   }
 
-  const rewritten = String(markdown || "").replace(/(!?\[[^\]\n]*\]\()([^)\s]+)(\))/g, (match, prefix, href, suffix) => {
+  const rewriteChunk = (chunk) => String(chunk || "").replace(/(!?\[[^\]\n]*\]\()([^)\s]+)(\))/g, (match, prefix, href, suffix) => {
     const clean = cleanMarkdownHref(href);
     let decoded = clean.split("#")[0].split("?")[0];
     try {
@@ -2283,7 +2405,56 @@ function collectLocalAttachmentLinks(markdown, assetDirName) {
     return prefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
   });
 
+  const text = String(markdown || "");
+  const sectionPattern = legacyAttachmentSectionRegExp();
+  let rewritten = "";
+  let offset = 0;
+  for (const match of text.matchAll(sectionPattern)) {
+    rewritten += rewriteChunk(text.slice(offset, match.index));
+    rewritten += match[0];
+    offset = match.index + match[0].length;
+  }
+  rewritten += rewriteChunk(text.slice(offset));
+
   return { markdown: rewritten, refs };
+}
+
+function legacyAttachmentFilePlans(attachments) {
+  const used = new Set();
+  return (attachments || []).map((att) => {
+    let fileName = att.fileName || sanitizeFileName(att.name || att.attGuid, "attachment");
+    const ext = fileName.includes(".") ? fileName.replace(/^.*(\.[^.]+)$/, "$1") : "";
+    const base = ext ? fileName.slice(0, -ext.length) : fileName;
+    let unique = fileName;
+    let n = 2;
+    while (used.has(unique.toLowerCase())) {
+      unique = base + " (" + n + ")" + ext;
+      n += 1;
+    }
+    used.add(unique.toLowerCase());
+    return { ...att, fileName: unique };
+  });
+}
+
+function rewriteLegacyAttachmentSection(markdown, legacyAttachments, assetDirName) {
+  const text = String(markdown || "");
+  const sectionPattern = legacyAttachmentSectionRegExp();
+  const clean = text.replace(sectionPattern, "\n").replace(/\n{3,}$/g, "\n\n").trimEnd();
+  const downloaded = (legacyAttachments || []).filter((att) => att.ok && (att.fileName || att.path));
+  if (!downloaded.length) return clean + "\n";
+  const lines = [
+    "",
+    LEGACY_ATTACHMENT_SECTION_START,
+    "## Attachments",
+    "",
+  ];
+  for (const att of downloaded) {
+    const fileName = att.fileName || basenameFromUrl(att.path);
+    const label = String(att.name || fileName || "attachment").replace(/[\]\n\r]/g, " ");
+    lines.push(`- [${label}](${markdownUrl(assetDirName + "/" + fileName)})`);
+  }
+  lines.push(LEGACY_ATTACHMENT_SECTION_END, "");
+  return clean + "\n" + lines.join("\n");
 }
 
 function rewriteAttachmentFrontmatter(markdown, legacyCount, bodyCount) {
@@ -2594,6 +2765,10 @@ function upsertByResourceName(items, record) {
   else items.push(record);
 }
 
+function isLossyNoteRecord(note) {
+  return !!(note && (note.degraded || /-plain-text$/.test(String(note.source || ""))));
+}
+
 function noteModifiedMs(doc) {
   return Math.max(Number(doc.dataModified) || 0, Number(doc.infoModified) || 0);
 }
@@ -2665,127 +2840,242 @@ async function runAttachmentsOnly(args) {
   let attachmentsFound = 0;
   let attachmentsDownloaded = 0;
   let attachmentsMissing = 0;
+  let legacyAttachmentsFound = 0;
+  let legacyAttachmentsDownloaded = 0;
+  let bodyAttachmentsFound = 0;
+  let bodyAttachmentsDownloaded = 0;
 
   let current = 0;
   while (current < selected.length) {
     let restartBrowser = false;
     await withBrowser(args, async (cdp) => {
       while (current < selected.length && !restartBrowser) {
-      const i = current;
-      const noteRecord = selected[i];
-      const doc = docsByKey.get(noteKey(noteRecord.kbGuid, noteRecord.docGuid));
-      if (!doc || !isCoEdit(doc.type)) {
-        current += 1;
-        continue;
-      }
-      const markdownPath = path.join(args.out, noteRecord.markdownPath);
-      if (!(await pathExists(markdownPath))) {
-        current += 1;
-        continue;
-      }
+        const i = current;
+        const noteRecord = selected[i];
+        const doc = docsByKey.get(noteKey(noteRecord.kbGuid, noteRecord.docGuid));
+        if (!doc) {
+          current += 1;
+          continue;
+        }
+        const markdownPath = path.join(args.out, noteRecord.markdownPath);
+        if (!(await pathExists(markdownPath))) {
+          current += 1;
+          continue;
+        }
 
-      const assetDirName = path.basename(noteRecord.assetDir || `${stripMarkdownExt(path.basename(markdownPath))}.assets`);
-      const assetDir = path.join(path.dirname(markdownPath), assetDirName);
-      const originalMarkdown = await fsp.readFile(markdownPath, "utf8");
-      const collected = collectLocalAttachmentLinks(originalMarkdown, assetDirName);
-      const refs = collected.refs.filter((ref) => ref.kind === "attachment");
-      if (!refs.length) {
-        current += 1;
-        continue;
-      }
+        const assetDirName = path.basename(noteRecord.assetDir || `${stripMarkdownExt(path.basename(markdownPath))}.assets`);
+        const assetDir = path.join(path.dirname(markdownPath), assetDirName);
+        const originalMarkdown = await fsp.readFile(markdownPath, "utf8");
+        const previousAttachments = noteRecord.attachments || [];
+        const previousLegacyAttachments = previousAttachments.filter((att) => att.kind === "legacy-indexeddb");
+        const previousBodyAttachments = previousAttachments.filter((att) => att.kind === "coedit-body-link");
+        const previousOtherAttachments = previousAttachments.filter((att) => att.kind !== "legacy-indexeddb" && att.kind !== "coedit-body-link");
+        const processBodyAttachments = !args.legacyAttachmentsOnly && isCoEdit(doc.type);
+        const processLegacyAttachments = !args.bodyAttachmentsOnly;
+        const collected = processBodyAttachments
+          ? collectLocalAttachmentLinks(originalMarkdown, assetDirName)
+          : { markdown: originalMarkdown, refs: [] };
+        const refs = processBodyAttachments ? collected.refs.filter((ref) => ref.kind === "attachment") : [];
+        const legacyAttachments = processLegacyAttachments
+          ? legacyAttachmentFilePlans(previousLegacyAttachments)
+          : previousLegacyAttachments;
 
-      const legacyAttachments = (noteRecord.attachments || []).filter((att) => att.kind !== "coedit-body-link");
-      const rewrittenMarkdown = rewriteAttachmentFrontmatter(collected.markdown, legacyAttachments.length, refs.length);
-      if (rewrittenMarkdown !== originalMarkdown) {
-        await fsp.writeFile(markdownPath, rewrittenMarkdown, "utf8");
-      }
+        if (!refs.length && (!processLegacyAttachments || !legacyAttachments.length)) {
+          current += 1;
+          continue;
+        }
 
-      const kb = indexes.kbsByGuid.get(doc.kbGuid) || {};
-      const existingResources = [];
-      const refsToFetch = [];
-      for (const ref of refs) {
-        const existingPath = path.join(assetDir, ref.fileName);
-        const stat = await fsp.stat(existingPath).catch(() => null);
-        if (stat && stat.size > 0) {
-          existingResources.push({
-            ...ref,
-            ok: true,
-            source: "existing-export",
-            originalSource: ref.source,
-            fetchSource: "existing-export",
-            byteLength: stat.size,
-            path: path.relative(args.out, existingPath),
-          });
+        const kb = indexes.kbsByGuid.get(doc.kbGuid) || {};
+        const existingResources = [];
+        const refsToFetch = [];
+        for (const ref of refs) {
+          const existingPath = path.join(assetDir, ref.fileName);
+          const stat = await fsp.stat(existingPath).catch(() => null);
+          if (stat && stat.size > 0) {
+            existingResources.push({
+              ...ref,
+              ok: true,
+              source: "existing-export",
+              originalSource: ref.source,
+              fetchSource: "existing-export",
+              byteLength: stat.size,
+              path: path.relative(args.out, existingPath),
+            });
+          } else {
+            refsToFetch.push(ref);
+          }
+        }
+
+        let resources = existingResources;
+        if (refsToFetch.length) {
+          const expression = `window.__WIZ_EXPORT__.fetchResources(${JSON.stringify({
+            note: doc,
+            kb,
+            refs: refsToFetch,
+            attachmentTimeoutMs: args.attachmentTimeoutMs,
+          })})`;
+          const timeoutMs = Math.max(args.noteTimeoutMs, refsToFetch.length * args.attachmentTimeoutMs + 15000);
+          try {
+            resources = resources.concat(await evaluateWithTimeout(cdp, expression, timeoutMs, `attachments ${doc.docGuid}`));
+          } catch (err) {
+            resources = resources.concat(refsToFetch.map((ref) => ({
+              ...ref,
+              ok: false,
+              source: "attachment-timeout",
+              originalSource: ref.source,
+              fetchSource: "timeout",
+              reason: err && err.message ? err.message : String(err),
+            })));
+            restartBrowser = true;
+          }
+        }
+
+        const existingLegacyAttachments = [];
+        const legacyToFetch = [];
+        if (processLegacyAttachments) {
+          for (const att of legacyAttachments) {
+            const existingPath = path.join(assetDir, att.fileName);
+            const stat = await fsp.stat(existingPath).catch(() => null);
+            if (stat && stat.size > 0) {
+              existingLegacyAttachments.push({
+                ...att,
+                ok: true,
+                fileName: att.fileName,
+                path: path.relative(args.out, existingPath),
+                fetchSource: att.fetchSource || "existing-export",
+                byteLength: stat.size,
+              });
+            } else {
+              legacyToFetch.push(att);
+            }
+          }
         } else {
-          refsToFetch.push(ref);
+          existingLegacyAttachments.push(...legacyAttachments);
         }
-      }
 
-      let resources = existingResources;
-      if (refsToFetch.length) {
-        const expression = `window.__WIZ_EXPORT__.fetchResources(${JSON.stringify({ note: doc, kb, refs: refsToFetch })})`;
-        try {
-          resources = resources.concat(await evaluateWithTimeout(cdp, expression, args.noteTimeoutMs, `attachments ${doc.docGuid}`));
-        } catch (err) {
-          resources = resources.concat(refsToFetch.map((ref) => ({
-            ...ref,
-            ok: false,
-            source: "attachment-timeout",
-            originalSource: ref.source,
-            fetchSource: "timeout",
-            reason: err && err.message ? err.message : String(err),
-          })));
-          restartBrowser = true;
+        let fetchedLegacyAttachments = [];
+        if (legacyToFetch.length) {
+          const expression = `window.__WIZ_EXPORT__.fetchLegacyAttachments(${JSON.stringify({
+            note: doc,
+            kb,
+            attachments: legacyToFetch,
+            attachmentTimeoutMs: args.attachmentTimeoutMs,
+          })})`;
+          const timeoutMs = Math.max(args.noteTimeoutMs, legacyToFetch.length * args.attachmentTimeoutMs + 15000);
+          try {
+            fetchedLegacyAttachments = await evaluateWithTimeout(cdp, expression, timeoutMs, `legacy attachments ${doc.docGuid}`);
+          } catch (err) {
+            fetchedLegacyAttachments = legacyToFetch.map((att) => ({
+              ...att,
+              ok: false,
+              source: "attachment-timeout",
+              fetchSource: "timeout",
+              reason: err && err.message ? err.message : String(err),
+            }));
+            restartBrowser = true;
+          }
         }
-      }
 
-      if (!Array.isArray(noteRecord.resources)) noteRecord.resources = [];
-      noteRecord.attachments = legacyAttachments;
+        if (!Array.isArray(noteRecord.resources)) noteRecord.resources = [];
+        const bodyAttachmentRecords = [];
 
-      for (const resource of resources || []) {
-        const resourceRecord = {
-          source: resource.originalSource || resource.source,
-          resourceName: resource.resourceName,
-          fileName: resource.fileName,
-          kind: resource.kind || "attachment",
-          ok: !!resource.ok,
-          reason: resource.reason,
-          fetchSource: resource.fetchSource || resource.source,
-          byteLength: resource.byteLength || 0,
-        };
-        if (resource.path) resourceRecord.path = resource.path;
-        if (resource.ok && resource.base64) {
-          const filePath = path.join(assetDir, resource.fileName);
-          await writeBase64File(filePath, resource.base64);
-          resourceRecord.path = path.relative(args.out, filePath);
+        for (const resource of resources || []) {
+          const resourceRecord = {
+            source: resource.originalSource || resource.source,
+            resourceName: resource.resourceName,
+            fileName: resource.fileName,
+            kind: resource.kind || "attachment",
+            ok: !!resource.ok,
+            reason: resource.reason,
+            fetchSource: resource.fetchSource || resource.source,
+            byteLength: resource.byteLength || 0,
+          };
+          if (resource.path) resourceRecord.path = resource.path;
+          if (resource.ok && resource.base64) {
+            const filePath = path.join(assetDir, resource.fileName);
+            await writeBase64File(filePath, resource.base64);
+            resourceRecord.path = path.relative(args.out, filePath);
+          }
+          upsertByResourceName(noteRecord.resources, resourceRecord);
+          bodyAttachmentRecords.push({
+            kind: "coedit-body-link",
+            name: resource.fileName || resource.resourceName,
+            resourceName: resource.resourceName,
+            ok: resourceRecord.ok,
+            path: resourceRecord.path,
+            reason: resourceRecord.reason,
+            fetchSource: resourceRecord.fetchSource,
+            byteLength: resourceRecord.byteLength,
+          });
         }
-        upsertByResourceName(noteRecord.resources, resourceRecord);
-        noteRecord.attachments.push({
-          kind: "coedit-body-link",
-          name: resource.fileName || resource.resourceName,
-          resourceName: resource.resourceName,
-          ok: resourceRecord.ok,
-          path: resourceRecord.path,
-          reason: resourceRecord.reason,
-          fetchSource: resourceRecord.fetchSource,
-          byteLength: resourceRecord.byteLength,
-        });
-      }
 
-      notesChanged += 1;
-      attachmentsFound += refs.length;
-      attachmentsDownloaded += (resources || []).filter((resource) => resource.ok).length;
-      attachmentsMissing += (resources || []).filter((resource) => !resource.ok).length;
+        const legacyAttachmentRecords = existingLegacyAttachments;
+        for (const att of fetchedLegacyAttachments || []) {
+          const record = {
+            kind: "legacy-indexeddb",
+            attGuid: att.attGuid,
+            name: att.name,
+            dataSize: att.dataSize,
+            status: att.status,
+            fileName: att.fileName,
+            ok: !!att.ok,
+            reason: att.reason,
+            fetchSource: att.fetchSource || att.source,
+            byteLength: att.byteLength || 0,
+          };
+          if (att.ok && att.base64) {
+            const filePath = path.join(assetDir, att.fileName);
+            await writeBase64File(filePath, att.base64);
+            record.path = path.relative(args.out, filePath);
+          }
+          legacyAttachmentRecords.push(record);
+        }
 
-      if (!args.json) {
-        console.log(`[${i + 1}/${selected.length}] ${noteRecord.markdownPath}, attachments ${attachmentsDownloaded}/${attachmentsFound}`);
-      }
-      current += 1;
+        const keptBodyAttachments = processBodyAttachments ? bodyAttachmentRecords : previousBodyAttachments;
+        noteRecord.attachments = legacyAttachmentRecords.concat(keptBodyAttachments, previousOtherAttachments);
+        const markdownWithFrontmatter = rewriteAttachmentFrontmatter(
+          collected.markdown,
+          legacyAttachmentRecords.length,
+          processBodyAttachments ? refs.length : previousBodyAttachments.length
+        );
+        const rewrittenMarkdown = processLegacyAttachments
+          ? rewriteLegacyAttachmentSection(markdownWithFrontmatter, legacyAttachmentRecords, assetDirName)
+          : markdownWithFrontmatter;
+        if (rewrittenMarkdown !== originalMarkdown) {
+          await fsp.writeFile(markdownPath, rewrittenMarkdown, "utf8");
+        }
+
+        const bodyOk = bodyAttachmentRecords.filter((att) => att.ok && att.path).length;
+        const legacyOk = legacyAttachmentRecords.filter((att) => att.ok && att.path).length;
+        const bodyMissing = bodyAttachmentRecords.filter((att) => !att.ok || !att.path).length;
+        const legacyMissing = legacyAttachmentRecords.filter((att) => !att.ok || !att.path).length;
+
+        notesChanged += 1;
+        if (processBodyAttachments) {
+          bodyAttachmentsFound += refs.length;
+          bodyAttachmentsDownloaded += bodyOk;
+          attachmentsFound += refs.length;
+          attachmentsDownloaded += bodyOk;
+          attachmentsMissing += bodyMissing;
+        }
+        if (processLegacyAttachments) {
+          legacyAttachmentsFound += legacyAttachmentRecords.length;
+          legacyAttachmentsDownloaded += legacyOk;
+          attachmentsFound += legacyAttachmentRecords.length;
+          attachmentsDownloaded += legacyOk;
+          attachmentsMissing += legacyMissing;
+        }
+
+        await writeManifest(manifestPath, manifest);
+        if (!args.json) {
+          console.log(`[${i + 1}/${selected.length}] ${noteRecord.markdownPath}, attachments ${attachmentsDownloaded}/${attachmentsFound}`);
+        }
+        current += 1;
       }
     }, { includeResourceCache: true });
   }
 
-  manifest.stage = "stage-2-coedit-attachments";
+  manifest.stage = "stage-2-attachments";
   manifest.attachmentsUpdatedAt = new Date().toISOString();
   await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
 
@@ -2797,11 +3087,17 @@ async function runAttachmentsOnly(args) {
     attachmentsFound,
     attachmentsDownloaded,
     attachmentsMissing,
+    bodyAttachmentsFound,
+    bodyAttachmentsDownloaded,
+    legacyAttachmentsFound,
+    legacyAttachmentsDownloaded,
   };
   if (args.json) console.log(JSON.stringify(summary, null, 2));
   else {
     console.log(`\nDone. Notes updated: ${summary.notesChanged}`);
     console.log(`Attachments: ${summary.attachmentsDownloaded}/${summary.attachmentsFound}`);
+    if (summary.bodyAttachmentsFound) console.log(`Body attachments: ${summary.bodyAttachmentsDownloaded}/${summary.bodyAttachmentsFound}`);
+    if (summary.legacyAttachmentsFound) console.log(`Legacy attachments: ${summary.legacyAttachmentsDownloaded}/${summary.legacyAttachmentsFound}`);
     if (summary.attachmentsMissing) console.log(`Missing attachments: ${summary.attachmentsMissing}`);
     console.log(`Manifest: ${manifestPath}`);
   }
@@ -2878,11 +3174,24 @@ async function runExport(args) {
 
   await fsp.mkdir(args.out, { recursive: true });
   const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
-  const existingManifest = args.resume ? await loadManifest(manifestPath) : null;
+  const existingManifest = (args.resume || args.failedOnly || args.degradedOnly) ? await loadManifest(manifestPath) : null;
+  if ((args.failedOnly || args.degradedOnly) && !existingManifest) {
+    throw new Error(`${args.degradedOnly ? "--degraded-only" : "--failed-only"} requires an existing manifest: ${manifestPath}`);
+  }
   const previousNotes = existingManifest && Array.isArray(existingManifest.notes) ? existingManifest.notes : [];
+  const previousSkipped = existingManifest && Array.isArray(existingManifest.skipped) ? existingManifest.skipped : [];
   const previousByDoc = new Map(previousNotes
     .filter((note) => note && note.docGuid)
     .map((note) => [note.docGuid, note]));
+
+  if (args.failedOnly) {
+    const failedGuids = new Set(previousNotes.filter((note) => note && !note.ok).map((note) => note.docGuid));
+    docs = docs.filter((doc) => failedGuids.has(doc.docGuid));
+  }
+  if (args.degradedOnly) {
+    const degradedGuids = new Set(previousNotes.filter((note) => isLossyNoteRecord(note)).map((note) => note.docGuid));
+    docs = docs.filter((doc) => degradedGuids.has(doc.docGuid));
+  }
 
   let plans = noteOutputPlan(docs, args.out);
   const skippedForResume = [];
@@ -2891,13 +3200,17 @@ async function runExport(args) {
     const pending = [];
     for (const plan of plans) {
       const previous = previousByDoc.get(plan.doc.docGuid);
-      if (args.skipFailed && previous && !previous.ok) {
+      if (args.failedOnly || args.degradedOnly) {
+        pending.push(plan);
+        continue;
+      }
+      if (args.skipFailed && previous && (!previous.ok || isLossyNoteRecord(previous))) {
         skippedForPreviousFailure.push(plan);
         continue;
       }
       const hasMarkdown = await pathExists(plan.filePath);
-      const manifestFresh = hasMarkdown && previous && previous.ok && previous.updated === new Date(noteModifiedMs(plan.doc)).toISOString();
-      const fileFresh = await isPlanFreshFromFile(plan);
+      const manifestFresh = hasMarkdown && previous && previous.ok && !isLossyNoteRecord(previous) && previous.updated === new Date(noteModifiedMs(plan.doc)).toISOString();
+      const fileFresh = previous ? false : await isPlanFreshFromFile(plan);
       if (manifestFresh || fileFresh) skippedForResume.push(plan);
       else pending.push(plan);
     }
@@ -2968,6 +3281,8 @@ async function runExport(args) {
     assetDir: path.relative(args.out, plan.assetDir),
     source: result.source,
     ok: !!result.ok,
+    degraded: !!result.degraded,
+    error: result.error,
     updated: new Date(noteModifiedMs(plan.doc)).toISOString(),
     resources: [],
     attachments: attachments.map((att) => ({
@@ -3000,6 +3315,12 @@ async function runExport(args) {
   if (args.resume && skippedForPreviousFailure.length) {
     log(args, `Resume: skipped ${skippedForPreviousFailure.length} previously failed notes`);
   }
+  if (args.failedOnly) {
+    log(args, `Retrying ${plans.length} previously failed notes`);
+  }
+  if (args.degradedOnly) {
+    log(args, `Retrying ${plans.length} lossy plain-text fallback notes`);
+  }
   if (prunedSkippedWebClips) {
     log(args, `Pruned ${prunedSkippedWebClips} stale web-clip exports`);
   }
@@ -3023,10 +3344,11 @@ async function runExport(args) {
           downloadAttachments: args.downloadAttachments,
           simpleHtml: args.simpleHtml || !!plan.simpleHtmlAttempt,
           plainText: !!plan.plainTextAttempt,
+          convertTimeoutMs: args.noteTimeoutMs,
+          resourceConcurrency: 4,
         })})`;
         let result;
-        const hasLocalBody = noteHasLocalBody(doc, indexes);
-        const convertTimeoutMs = hasLocalBody ? Math.min(args.noteTimeoutMs, 30000) : args.noteTimeoutMs;
+        const convertTimeoutMs = Math.max(args.noteTimeoutMs + 60000, args.noteTimeoutMs);
         try {
           result = await evaluateWithTimeout(cdp, expression, convertTimeoutMs, `convert ${doc.docGuid}`);
         } catch (err) {
