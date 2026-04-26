@@ -3262,6 +3262,33 @@ function frontmatter(doc, attachments, bodyAttachments = []) {
   return `${lines.join("\n")}\n\n`;
 }
 
+function normalizeHeadingTitle(value) {
+  return String(value || "")
+    .replace(/\\([\\`*_{}\[\]()#+\-.!>])/g, "$1")
+    .replace(/^\[([^\]]+)\]\([^)]+\)$/g, "$1")
+    .replace(/[*_~`]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripLeadingTitleHeading(markdown, title) {
+  const text = String(markdown || "").replace(/^\uFEFF/, "");
+  const lines = text.split(/\r?\n/);
+  let index = 0;
+  while (index < lines.length && !lines[index].trim()) index += 1;
+  if (index >= lines.length) return text;
+  const match = lines[index].match(/^#\s+(.*?)\s*#*\s*$/);
+  if (!match) return text;
+  const heading = normalizeHeadingTitle(match[1]);
+  const expected = normalizeHeadingTitle(title);
+  if (!heading || !expected || heading !== expected) return text;
+  lines.splice(index, 1);
+  if (index < lines.length && !lines[index].trim()) {
+    lines.splice(index, 1);
+  }
+  return lines.join("\n").replace(/^\n+/, "");
+}
+
 function noteOutputPlan(docs, outDir) {
   const used = new Map();
   return docs.map((doc) => {
@@ -4857,7 +4884,8 @@ async function runExport(args) {
         }
 
         const bodyAttachments = (result.resources || []).filter((resource) => resource.kind === "attachment");
-        const markdown = frontmatter(doc, attachments, bodyAttachments) + String(result.markdown || "").trimEnd() + "\n";
+        const normalizedBody = stripLeadingTitleHeading(String(result.markdown || ""), doc.title || "");
+        const markdown = frontmatter(doc, attachments, bodyAttachments) + normalizedBody.trimEnd() + "\n";
         await fsp.mkdir(path.dirname(plan.filePath), { recursive: true });
         await fsp.writeFile(plan.filePath, markdown, "utf8");
 
