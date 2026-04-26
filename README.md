@@ -6,6 +6,7 @@ Stage 1 exports:
 
 - folder tree as directories
 - note body as Markdown
+- collaboration comments are intentionally not exported
 - images/resources referenced by note body into per-note `.assets` folders
 - export manifest with skipped notes, missing resources, and attachment metadata counts
 
@@ -14,6 +15,12 @@ WizNote's "download all notes" setting helps before a full export, but it should
 For legacy ordinary notes, prefer upgrading them to WizNote's `lite/markdown` format first with `upgrade-legacy`. The command reuses the same LiveEditor conversion path as the desktop client's title-left "upgrade to realtime Markdown" button, but drives it through authenticated WizNote server APIs instead of UI clicks. `export --fetch-missing` then downloads note bodies and resources from the server first, using the local WizNote view server only as a fallback.
 
 Stage 2 adds collaboration-note file attachments: local Markdown file links such as `[office](...)` are rewritten into the note's `.assets/` directory and downloaded through the same authenticated resource path used for collaboration images.
+
+## Current Export Policy
+
+The exporter now treats note-body Markdown as the migration target and does not export WizNote collaboration comments. In practice this means the main conversion path uses the same Markdown body/resource flow as before, but with comments disabled globally. This avoids known collaboration-note conversion crashes triggered by comment rendering while keeping note body images and file links intact.
+
+Because comments are intentionally excluded, `RTL DDR利用率` and similar notes no longer need a special degraded fallback. For ordinary full-batch exports, note-route "open note first" prewarm is not part of the default strategy anymore; it remains only as a diagnostic path for unusual collaboration-note failures.
 
 ## Commands
 
@@ -115,6 +122,19 @@ Useful options:
 - `--json`: print machine-readable status/export summary
 - `snapshot`: diagnostic command that prints the raw local IndexedDB snapshot
 - `--profile PATH`: override the WizNote profile path
+
+## Current Batch Status
+
+As of 2026-04-26, the main `export-coedit` batch state is:
+
+- exported successfully: `2258`
+- retryable failures: `0`
+- degraded exports: `0`
+- permanent failures: `1`
+
+Current permanent failure list:
+
+- `分段bitn压缩` (`43a9c683-9b71-4f3a-8b47-9029f3f6a4c5`): user-marked permanent failure; the note is abnormal and is no longer retried by `--failed-only`
 
 ## Obsidian and SiYuan Notes
 

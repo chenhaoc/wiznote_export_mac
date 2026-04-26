@@ -17,13 +17,14 @@ const DEFAULT_LIVE_EDITOR =
   "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js";
 const DEFAULT_OUT = path.resolve(process.cwd(), "export");
 
-const COMMANDS = new Set(["status", "snapshot", "export", "upgrade-legacy", "help"]);
+const COMMANDS = new Set(["status", "snapshot", "export", "warm", "upgrade-legacy", "help"]);
 
 function usage() {
   return `Usage:
   node scripts/wiz-export.js status [--json] [--profile PATH]
   node scripts/wiz-export.js snapshot [--json] [--profile PATH]
   node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js warm --out DIR [--failed-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
 
 Options:
@@ -51,6 +52,7 @@ Options:
                      Timeout for one note conversion. Default: 90000
   --attachment-timeout-ms N
                      Timeout for one attachment/resource download. Default: 120000
+  --failed-only      For warm, select failed notes from the export manifest
   --limit N          Export at most N notes
   --only DOC_GUID    Export one note by docGuid
   --json             Print JSON
@@ -151,6 +153,181 @@ function parseArgs(argv) {
 
 function log(args, message) {
   if (!args.json) console.log(message);
+}
+
+function rendererDirFromLiveEditor(liveEditorPath) {
+  return path.resolve(path.dirname(liveEditorPath), "../../../app.asar.unpacked/dist/renderer");
+}
+
+function mimeTypeForPath(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".html": return "text/html; charset=utf-8";
+    case ".js": return "application/javascript; charset=utf-8";
+    case ".css": return "text/css; charset=utf-8";
+    case ".json": return "application/json; charset=utf-8";
+    case ".svg": return "image/svg+xml";
+    case ".png": return "image/png";
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    case ".woff": return "font/woff";
+    case ".woff2": return "font/woff2";
+    case ".ttf": return "font/ttf";
+    default: return "application/octet-stream";
+  }
+}
+
+function buildRendererShellHtml() {
+  return [
+    "<!doctype html>",
+    "<html>",
+    "<head>",
+    "<meta charset=\"utf-8\">",
+    "<title>WizNote</title>",
+    "<link rel=\"stylesheet\" href=\"/wiz-app/renderer.dev.css\">",
+    "</head>",
+    "<body class=\"desktop-body\">",
+    "<script>window.cdnRoot='';</script>",
+    "<script src=\"/wiz-app/wizapp-shim.js\"></script>",
+    "<script src=\"/live-editor/index.js\"></script>",
+    "<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/wiz-app/sw.js',{scope:'/wiz-app/'}).catch(console.error);}</script>",
+    "<div id=\"root\"></div>",
+    "<script defer src=\"/wiz-app/renderer.dev.js\"></script>",
+    "</body>",
+    "</html>",
+  ].join("");
+}
+
+function buildWizAppShim({ appPort }) {
+  const port = Number.isFinite(appPort) ? appPort : 0;
+  return String.raw`
+(() => {
+  if (window.wizApp) return;
+  const settingsPrefix = "__wizapp_setting__:";
+  const readSetting = (key, fallback) => {
+    try {
+      const raw = window.localStorage.getItem(settingsPrefix + key);
+      return raw == null ? fallback : JSON.parse(raw);
+    } catch {
+      return fallback;
+    }
+  };
+  const writeSetting = (key, value) => {
+    try {
+      window.localStorage.setItem(settingsPrefix + key, JSON.stringify(value));
+    } catch {}
+  };
+  const decodeText = async (response, responseType) => {
+    if (responseType === "arraybuffer") return response.arrayBuffer();
+    if (responseType === "blob") return response.blob();
+    if (responseType === "json") return response.json();
+    return response.text();
+  };
+  const objectHeaders = (headers) => {
+    const out = {};
+    headers.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  };
+  const corsFetch = async (options = {}) => {
+    const method = String(options.method || "GET").toUpperCase();
+    const headers = { ...(options.headers || {}) };
+    let body = options.data;
+    if (body && typeof body === "object" && !(body instanceof ArrayBuffer) && !(body instanceof Blob) && !(body instanceof FormData) && !ArrayBuffer.isView(body)) {
+      body = JSON.stringify(body);
+      if (!headers["content-type"] && !headers["Content-Type"]) headers["content-type"] = "application/json";
+    }
+    const response = await fetch(options.url, {
+      method,
+      headers,
+      body,
+      credentials: options.withCredentials ? "include" : "same-origin",
+    });
+    return {
+      data: await decodeText(response, options.responseType),
+      headers: objectHeaders(response.headers),
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+    };
+  };
+  const noop = async () => "";
+  const shell = {
+    openFile: noop,
+    saveFile: noop,
+    editFile: noop,
+    saveFiles: async () => "",
+    readFile: async () => null,
+    writeFile: async () => "",
+    showSaveDialog: async () => "",
+    showOpenDialog: async () => "",
+  };
+  const windowManager = {
+    sendToMain: () => {},
+    toggleMaximize: () => {},
+    toggleFullScreen: () => {},
+    minimizeWindow: () => {},
+    closeWindow: () => {},
+    isFullScreen: async () => false,
+    isMaximized: async () => false,
+    showSystemMenu: async () => {},
+    openImageViewer: () => {},
+    exportPdf: () => {},
+    exportPhoto: () => {},
+    exportMarkdown: () => {},
+    sendMessage: () => {},
+    gotoThirdpartyAuth: () => {},
+    saveFile: () => {},
+    executeCommand: () => {},
+    checkUpdate: async () => null,
+    quitAndInstall: () => {},
+    openInNewWindow: () => {},
+    editImage: async () => null,
+    bindQQ: () => {},
+  };
+  window.wizApp = {
+    isElectron: true,
+    isMainWindow: true,
+    localhostPort: ${JSON.stringify(port)},
+    version: "0.1.107",
+    windowManager,
+    settings: {
+      set: writeSetting,
+      get: (key, fallback) => readSetting(key, fallback),
+      getLanguage: () => readSetting("language", "zh-CN"),
+      setLanguage: async (lang) => writeSetting("language", lang),
+    },
+    platform: {
+      isMac: true,
+      isWindows: false,
+      isLinux: false,
+      isAndroid: false,
+      isIOS: false,
+    },
+    crypto: {
+      rsaDecrypt: async () => null,
+      rsaEncrypt: async () => null,
+      rsaGenerate: async () => null,
+    },
+    utils: {
+      corsFetch,
+      shell,
+      watchFile: async () => "",
+      unwatchFile: async () => "",
+      loadWatchedFile: async () => null,
+      clipboard: { readDoc: async () => null },
+      appLocker: { lockApp: async () => null, unlockApp: async () => null },
+    },
+    appPath: "/wiz-app",
+    getResourcesPath: () => "/wiz-app",
+    isDev: false,
+    isMobile: false,
+  };
+})();
+`;
 }
 
 function sleep(ms) {
@@ -267,8 +444,12 @@ async function detectWizNotePort() {
   }
 }
 
-async function startOriginServer({ liveEditorPath, appPort }) {
+async function startOriginServer({ liveEditorPath, appPort, writeRoot, rendererDir }) {
   const liveEditor = await fsp.readFile(liveEditorPath);
+  const resolvedWriteRoot = writeRoot ? path.resolve(writeRoot) : null;
+  const resolvedRendererDir = rendererDir ? path.resolve(rendererDir) : null;
+  const rendererShellHtml = resolvedRendererDir ? buildRendererShellHtml() : "";
+  const wizAppShim = buildWizAppShim({ appPort });
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://wiznote-desktop");
@@ -283,6 +464,36 @@ async function startOriginServer({ liveEditorPath, appPort }) {
         "cache-control": "no-store",
       });
       res.end(liveEditor);
+      return;
+    }
+    if (resolvedRendererDir && (url.pathname === "/wiz-app" || url.pathname === "/wiz-app/" || url.pathname === "/wiz-app/index.html")) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.end(rendererShellHtml);
+      return;
+    }
+    if (resolvedRendererDir && url.pathname === "/wiz-app/wizapp-shim.js") {
+      res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-store" });
+      res.end(wizAppShim);
+      return;
+    }
+    if (resolvedRendererDir && url.pathname.startsWith("/wiz-app/")) {
+      const relativePath = url.pathname.slice("/wiz-app/".length);
+      const targetPath = path.resolve(resolvedRendererDir, relativePath);
+      const allowed = targetPath.startsWith(`${resolvedRendererDir}${path.sep}`);
+      if (!allowed) {
+        res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+        res.end("forbidden");
+        return;
+      }
+      fsp.readFile(targetPath)
+      .then((content) => {
+        res.writeHead(200, { "content-type": mimeTypeForPath(targetPath), "cache-control": "no-store" });
+        res.end(content);
+      })
+      .catch(() => {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("not found");
+      });
       return;
     }
     if (url.pathname === "/__wiz_export_proxy") {
@@ -329,6 +540,43 @@ async function startOriginServer({ liveEditorPath, appPort }) {
           res.writeHead(err.name === "AbortError" ? 504 : 502, { "content-type": "text/plain; charset=utf-8" });
           res.end(`Remote proxy failed: ${err.message}`);
         });
+      });
+      return;
+    }
+    if (resolvedWriteRoot && url.pathname === "/__wiz_export_write") {
+      if (req.method !== "POST") {
+        res.writeHead(405, { "content-type": "text/plain; charset=utf-8" });
+        res.end("method not allowed");
+        return;
+      }
+      const targetPath = url.searchParams.get("path");
+      if (!targetPath) {
+        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+        res.end("missing target path");
+        return;
+      }
+      const resolvedTarget = path.resolve(targetPath);
+      const allowed = resolvedTarget === resolvedWriteRoot || resolvedTarget.startsWith(`${resolvedWriteRoot}${path.sep}`);
+      if (!allowed) {
+        res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+        res.end("target path is outside write root");
+        return;
+      }
+      const encoding = url.searchParams.get("encoding") || "binary";
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", async () => {
+        try {
+          const body = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+          await fsp.mkdir(path.dirname(resolvedTarget), { recursive: true });
+          const bytes = encoding === "base64" ? Buffer.from(body.toString("utf8"), "base64") : body;
+          await fsp.writeFile(resolvedTarget, bytes);
+          res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ ok: true, path: resolvedTarget, byteLength: bytes.byteLength }));
+        } catch (err) {
+          res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+          res.end(`write failed: ${err.message}`);
+        }
       });
       return;
     }
@@ -447,7 +695,13 @@ async function withBrowser(args, fn, options = {}) {
   const chromeUserData = path.join(tmpRoot, "chrome-user-data");
   const chromeProfile = path.join(chromeUserData, "Default");
   const appPort = await detectWizNotePort();
-  const originServer = await startOriginServer({ liveEditorPath: args.liveEditor, appPort });
+  const rendererDir = rendererDirFromLiveEditor(args.liveEditor);
+  const originServer = await startOriginServer({
+    liveEditorPath: args.liveEditor,
+    appPort,
+    writeRoot: args.out,
+    rendererDir: await pathExists(rendererDir) ? rendererDir : null,
+  });
   const debugPort = await getFreePort();
   let chrome = null;
   let cdp = null;
@@ -520,6 +774,111 @@ async function installPageHelpers(cdp) {
 ${browserHelperSource()}
   return window.__WIZ_EXPORT__.health();
 })()`);
+}
+
+async function navigateToHelperPage(cdp) {
+  await cdp.send("Page.navigate", { url: "http://wiznote-desktop/" });
+  await sleep(1000);
+  await installPageHelpers(cdp);
+}
+
+function noteRouteUrlForDoc(doc) {
+  const query = new URLSearchParams({
+    page: "note",
+    category: doc.category || "",
+    docGuid: doc.docGuid,
+    kbGuid: doc.kbGuid,
+    activeNoteGuid: doc.docGuid,
+  });
+  return `http://wiznote-desktop/wiz-app/index.html?${query.toString()}`;
+}
+
+async function openCoEditNoteRoute(cdp, doc, kb, args) {
+  const timeoutMs = Math.max(60000, Math.min(args.noteTimeoutMs, 300000));
+  await cdp.send("Page.navigate", { url: noteRouteUrlForDoc(doc) });
+  await sleep(3000);
+  await installPageHelpers(cdp);
+  return evaluateWithTimeout(
+    cdp,
+    `window.__WIZ_EXPORT__.waitForOpenCoEditNote(${JSON.stringify({
+      note: {
+        kbGuid: doc.kbGuid,
+        docGuid: doc.docGuid,
+      },
+      kbServer: kb && kb.kbServer ? kb.kbServer : "",
+      timeoutMs,
+      syncMissing: true,
+      requireEditor: true,
+    })})`,
+    timeoutMs + 10000,
+    `open-note ${doc.docGuid}`
+  );
+}
+
+async function warmCoEditDocByRoute(cdp, doc, kb, args) {
+  const timeoutMs = Math.max(60000, Math.min(args.noteTimeoutMs, 300000));
+  let last = null;
+  try {
+    await cdp.send("Page.navigate", { url: noteRouteUrlForDoc(doc) });
+    await sleep(4000);
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      last = await cdp.evaluate(`(async () => {
+        const info = {
+          href: location.href,
+          title: document.title,
+          readyState: document.readyState,
+        };
+        const getData = async () => {
+          if (!window.LiveEditor || !window.LiveEditor.getOfflineDocData) return null;
+          try {
+            return await window.LiveEditor.getOfflineDocData(${JSON.stringify(doc.kbGuid)}, ${JSON.stringify(doc.docGuid)});
+          } catch {
+            return null;
+          }
+        };
+        const blockCount = (value) => {
+          const candidates = [value];
+          if (value && typeof value === "object") {
+            candidates.push(value.docData, value.doc, value.data, value.document, value.content, value.payload);
+          }
+          for (const candidate of candidates) {
+            if (candidate && Array.isArray(candidate.blocks)) return candidate.blocks.length;
+          }
+          return 0;
+        };
+        let data = await getData();
+        const initialBlocks = blockCount(data);
+        if (initialBlocks) {
+          return { ok: true, blocks: initialBlocks, ...info };
+        }
+        if (window.LiveEditor && window.LiveEditor.syncOfflineDoc) {
+          try {
+            await window.LiveEditor.syncOfflineDoc(
+              ${JSON.stringify(kb && kb.kbServer ? kb.kbServer : "")},
+              ${JSON.stringify(doc.kbGuid)},
+              ${JSON.stringify(doc.docGuid)},
+              30000
+            );
+          } catch (err) {
+            info.syncError = err && err.message ? err.message : String(err);
+          }
+        }
+        data = await getData();
+        const blocks = blockCount(data);
+        return {
+          ok: !!blocks,
+          blocks,
+          ...info,
+        };
+      })()`);
+      if (last && last.ok) break;
+      await sleep(3000);
+    }
+  } finally {
+    await navigateToHelperPage(cdp);
+  }
+  return last || { ok: false, reason: "route-warm-no-result" };
 }
 
 function browserHelperSource() {
@@ -616,6 +975,22 @@ if (!window.__WIZ_EXPORT__) {
   async function valueToBase64(value) {
     const buffer = await valueToArrayBuffer(value);
     return buffer ? arrayBufferToBase64(buffer) : null;
+  }
+
+  async function writeBase64OutputFile(filePath, base64) {
+    const response = await fetch(
+      "/__wiz_export_write?path=" + encodeURIComponent(filePath) + "&encoding=base64",
+      {
+        method: "POST",
+        headers: { "content-type": "text/plain; charset=utf-8" },
+        body: String(base64 || ""),
+      }
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error("write-output-failed: " + (text || ("http-" + response.status)));
+    }
+    return response.json().catch(() => ({ ok: true, path: filePath }));
   }
 
   async function mapLimit(items, limit, fn) {
@@ -1276,6 +1651,200 @@ if (!window.__WIZ_EXPORT__) {
     return "";
   }
 
+  function browserWait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function normalizeCoEditDocData(value) {
+    if (!value || typeof value !== "object") return value;
+    const candidates = [value, value.docData, value.doc, value.data, value.document, value.content, value.payload]
+      .filter((candidate, index, list) => candidate && typeof candidate === "object" && list.indexOf(candidate) === index);
+    const doc = candidates.find((candidate) => Array.isArray(candidate.blocks));
+    if (!doc) return value;
+    if (doc === value) return doc;
+    return {
+      ...value,
+      ...doc,
+      meta: doc.meta || value.meta || null,
+    };
+  }
+
+  function sanitizeCoEditCommentsForMarkdown(value) {
+    const doc = normalizeCoEditDocData(value);
+    if (!doc || typeof doc !== "object") return doc;
+    if (!doc.comments || typeof doc.comments !== "object") return doc;
+    const comments = {};
+    let changed = false;
+    for (const [key, comment] of Object.entries(doc.comments)) {
+      if (!comment || typeof comment !== "object") {
+        comments[key] = comment;
+        continue;
+      }
+      if (Array.isArray(comment.blocks)) {
+        comments[key] = comment;
+        continue;
+      }
+      comments[key] = { ...comment, blocks: [] };
+      changed = true;
+    }
+    if (!changed) return doc;
+    return {
+      ...doc,
+      comments,
+    };
+  }
+
+  function summarizeCoEditDocData(value) {
+    if (!value || typeof value !== "object") return { kind: typeof value };
+    const normalized = normalizeCoEditDocData(value);
+    const blocks = normalized && Array.isArray(normalized.blocks) ? normalized.blocks : [];
+    return {
+      keys: Object.keys(value).slice(0, 12),
+      normalizedKeys: normalized && typeof normalized === "object" ? Object.keys(normalized).slice(0, 12) : [],
+      hasBlocks: !!blocks.length,
+      blockCount: blocks.length,
+      blockTypes: blocks.slice(0, 12).map((block, index) => ({
+        index,
+        type: block && block.type ? block.type : typeof block,
+        keys: block && typeof block === "object" ? Object.keys(block).slice(0, 10) : [],
+        embedType: block && block.embedType ? block.embedType : "",
+        embedDataKeys: block && block.embedData && typeof block.embedData === "object"
+          ? Object.keys(block.embedData).slice(0, 12)
+          : [],
+      })),
+      nestedBlockHolders: ["docData", "doc", "data", "document", "content", "payload"].filter((key) => {
+        const child = value[key];
+        return child && typeof child === "object" && Array.isArray(child.blocks);
+      }),
+    };
+  }
+
+  function findOpenCoEditEditor(note) {
+    if (!window.LiveEditor || typeof window.LiveEditor.getEditor !== "function") return null;
+    const roots = Array.from(document.querySelectorAll(".editor-main, .note-root-container, [contenteditable='true'], [data-doc-id]"));
+    const nodes = [];
+    const seenNodes = new Set();
+    const pushNode = (node) => {
+      if (!node || seenNodes.has(node)) return;
+      seenNodes.add(node);
+      nodes.push(node);
+    };
+    for (const root of roots) {
+      pushNode(root);
+      const descendants = root.querySelectorAll ? Array.from(root.querySelectorAll("*")).slice(0, 400) : [];
+      descendants.forEach(pushNode);
+    }
+    pushNode(document.activeElement);
+    const seen = new Set();
+    const exact = [];
+    const fallback = [];
+    for (const node of nodes) {
+      try {
+        const editor = window.LiveEditor.getEditor(node);
+        if (!editor || seen.has(editor)) continue;
+        seen.add(editor);
+        fallback.push(editor);
+        const auth = editor.auth || {};
+        if (auth.docId === note.docGuid && (!auth.appId || auth.appId === note.kbGuid)) {
+          exact.push(editor);
+        }
+      } catch {}
+    }
+    return exact[0] || fallback[0] || null;
+  }
+
+  function getOpenCoEditDocData(note) {
+    const editor = findOpenCoEditEditor(note);
+    if (!editor) {
+      return { ok: false, reason: "editor-not-found" };
+    }
+    let data = null;
+    try {
+      if (typeof editor.data === "function") data = editor.data();
+    } catch {}
+    if (!data) {
+      try {
+        if (editor.doc && typeof editor.doc.data === "function") data = editor.doc.data();
+      } catch {}
+    }
+    const normalized = normalizeCoEditDocData(data);
+    if (normalized && Array.isArray(normalized.blocks) && normalized.blocks.length) {
+      return {
+        ok: true,
+        source: "live-editor-open-note-editor",
+        data: normalized,
+        auth: editor.auth || null,
+      };
+    }
+    return {
+      ok: false,
+      reason: "editor-data-missing-blocks",
+      auth: editor.auth || null,
+      summary: summarizeCoEditDocData(data),
+    };
+  }
+
+  async function waitForOpenCoEditNote(payload) {
+    const note = payload && payload.note ? payload.note : {};
+    const timeoutMs = Math.max(5000, Number(payload && payload.timeoutMs) || 60000);
+    const kbServer = payload && payload.kbServer ? payload.kbServer : "";
+    const syncMissing = !!(payload && payload.syncMissing);
+    const requireEditor = !!(payload && payload.requireEditor);
+    const started = Date.now();
+    let last = null;
+    while (Date.now() - started < timeoutMs) {
+      const info = {
+        href: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        editorNodeCount: document.querySelectorAll(".editor-main, .note-root-container").length,
+      };
+      const openEditor = getOpenCoEditDocData(note);
+      if (openEditor && openEditor.ok) {
+        return {
+          ok: true,
+          source: openEditor.source,
+          blocks: openEditor.data.blocks.length,
+          auth: openEditor.auth || null,
+          ...info,
+        };
+      }
+      let offline = null;
+      if (window.LiveEditor && window.LiveEditor.getOfflineDocData) {
+        try {
+          offline = normalizeCoEditDocData(await window.LiveEditor.getOfflineDocData(note.kbGuid, note.docGuid));
+        } catch {}
+      }
+      if (!requireEditor && offline && Array.isArray(offline.blocks) && offline.blocks.length) {
+        return {
+          ok: true,
+          source: "live-editor-open-note-offline-doc",
+          blocks: offline.blocks.length,
+          ...info,
+        };
+      }
+      last = {
+        ok: false,
+        reason: openEditor && openEditor.reason ? openEditor.reason : "not-ready",
+        openEditor: openEditor && !openEditor.ok ? {
+          auth: openEditor.auth || null,
+          summary: openEditor.summary || null,
+        } : null,
+        offline: summarizeCoEditDocData(offline),
+        ...info,
+      };
+      if (syncMissing && kbServer && window.LiveEditor && window.LiveEditor.syncOfflineDoc) {
+        try {
+          await window.LiveEditor.syncOfflineDoc(kbServer, note.kbGuid, note.docGuid, 30000);
+        } catch (err) {
+          last.syncError = err && err.message ? err.message : String(err);
+        }
+      }
+      await browserWait(1500);
+    }
+    return last || { ok: false, reason: "timeout", href: location.href };
+  }
+
   function textToMarkdown(text) {
     return String(text || "")
       .split(/\r?\n/)
@@ -1733,7 +2302,7 @@ if (!window.__WIZ_EXPORT__) {
       "html2Doc"
     );
     const markdownBody = await withTimeout(
-      window.LiveEditor.doc2markdown(doc, { keepImageSize: true }),
+      window.LiveEditor.doc2markdown(doc, { keepImageSize: true, keepComments: false }),
       timeoutMs,
       "doc2markdown"
     );
@@ -1828,18 +2397,30 @@ if (!window.__WIZ_EXPORT__) {
     const { note, kb, assetDirName } = payload;
     const collector = createResourceCollector(assetDirName);
     const convertTimeoutMs = Math.max(5000, Number(payload.convertTimeoutMs) || 30000);
+    const keepComments = !!payload.exportComments;
     let markdown = "";
     let source = "";
     let missingBody = false;
     let coEditMeta = null;
+    let degradedMarkdownFallback = false;
 
     try {
       if (isCoEdit(note.type)) {
-        let data = await withTimeout(
-          window.LiveEditor.getOfflineDocData(note.kbGuid, note.docGuid),
-          30000,
-          "getOfflineDocData"
-        );
+        let data = null;
+        if (payload.preferOpenNoteEditor) {
+          const openEditor = getOpenCoEditDocData(note);
+          if (openEditor && openEditor.ok) {
+            data = openEditor.data;
+            source = openEditor.source;
+          }
+        }
+        if (!data) {
+          data = await withTimeout(
+            window.LiveEditor.getOfflineDocData(note.kbGuid, note.docGuid),
+            30000,
+            "getOfflineDocData"
+          );
+        }
         if (!data && payload.fetchMissing && kb && kb.kbServer && window.LiveEditor.syncOfflineDoc) {
           const synced = await withTimeout(
             window.LiveEditor.syncOfflineDoc(
@@ -1866,21 +2447,97 @@ if (!window.__WIZ_EXPORT__) {
         if (!data) {
           missingBody = true;
         } else {
-          coEditMeta = data.meta || null;
+          const docData = normalizeCoEditDocData(data);
+          coEditMeta = (docData && docData.meta) || data.meta || null;
           if (!source) source = "live-editor-offline-doc";
           if (payload.plainText) {
             source += "-plain-text";
-            markdown = textToMarkdown(coEditDocToText(data));
+            markdown = textToMarkdown(coEditDocToText(docData));
           } else {
-            markdown = await withTimeout(
-              window.LiveEditor.doc2markdown(data, {
-                keepImageSize: false,
-                keepComments: true,
-                buildResourceUrl: collector.buildResourceUrl,
-              }),
-              convertTimeoutMs,
-              "doc2markdown"
-            );
+            try {
+              markdown = await withTimeout(
+                window.LiveEditor.doc2markdown(docData, {
+                  keepImageSize: false,
+                  keepComments,
+                  buildResourceUrl: collector.buildResourceUrl,
+                }),
+                convertTimeoutMs,
+                "doc2markdown"
+              );
+            } catch (err) {
+              const sanitizedDoc = sanitizeCoEditCommentsForMarkdown(docData);
+              if (!markdown && keepComments) {
+                try {
+                  markdown = await withTimeout(
+                    window.LiveEditor.doc2markdown(docData, {
+                      keepImageSize: false,
+                      keepComments: false,
+                      buildResourceUrl: collector.buildResourceUrl,
+                    }),
+                    convertTimeoutMs,
+                    "doc2markdown-no-comments"
+                  );
+                  degradedMarkdownFallback = true;
+                  source = source ? source + "-comments-disabled" : "live-editor-comments-disabled";
+                } catch {}
+              }
+              if (!markdown && keepComments && sanitizedDoc && sanitizedDoc !== docData) {
+                try {
+                  markdown = await withTimeout(
+                    window.LiveEditor.doc2markdown(sanitizedDoc, {
+                      keepImageSize: false,
+                      keepComments: true,
+                      buildResourceUrl: collector.buildResourceUrl,
+                    }),
+                    convertTimeoutMs,
+                    "doc2markdown-comment-pruned"
+                  );
+                  degradedMarkdownFallback = true;
+                  source = source ? source + "-comment-pruned" : "live-editor-comment-pruned";
+                } catch {}
+              }
+              if (!markdown && payload.preferOpenNoteEditor) {
+                const openEditor = findOpenCoEditEditor(note);
+                if (openEditor && typeof openEditor.toMarkdown === "function") {
+                  try {
+                    const editorMarkdown = await withTimeout(
+                      Promise.resolve(openEditor.toMarkdown({ keepImageSize: false, keepComments })),
+                      convertTimeoutMs,
+                      "editor.toMarkdown"
+                    );
+                    if (editorMarkdown) {
+                      markdown = String(editorMarkdown);
+                      source = source ? source + "-editor-markdown" : "live-editor-open-note-editor-markdown";
+                    }
+                  } catch (editorErr) {
+                    const details = JSON.stringify(summarizeCoEditDocData(data));
+                    throw new Error(
+                      (err && err.message ? err.message : String(err)) +
+                      "; stack=" +
+                      (err && err.stack ? String(err.stack).split("\n").slice(0, 6).join(" | ") : "") +
+                      "; editor=" +
+                      (editorErr && editorErr.message ? editorErr.message : String(editorErr)) +
+                      "; editorStack=" +
+                      (editorErr && editorErr.stack ? String(editorErr.stack).split("\n").slice(0, 6).join(" | ") : "") +
+                      "; coedit=" +
+                      details
+                    );
+                  }
+                }
+              }
+              if (markdown) {
+                // markdown recovered via a fallback path above
+              } else {
+                const details = JSON.stringify(summarizeCoEditDocData(data));
+                throw new Error(
+                  (err && err.message ? err.message : String(err)) +
+                  "; stack=" +
+                  (err && err.stack ? String(err.stack).split("\n").slice(0, 6).join(" | ") : "") +
+                  "; coedit=" +
+                  details
+                );
+              }
+            }
           }
         }
       } else {
@@ -1905,7 +2562,7 @@ if (!window.__WIZ_EXPORT__) {
           markdown = await withTimeout(
             window.LiveEditor.doc2markdown(doc, {
               keepImageSize: false,
-              keepComments: true,
+              keepComments,
               buildResourceUrl: collector.buildResourceUrl,
             }),
             convertTimeoutMs,
@@ -1928,13 +2585,14 @@ if (!window.__WIZ_EXPORT__) {
         fillResourceData(note, kb, ref, coEditMeta)
       );
       const lossyPlainTextFallback = /-plain-text$/.test(source);
+      const lossyCommentFallback = degradedMarkdownFallback || /-(comment-pruned|comments-disabled)$/.test(source);
 
       return {
         ok: !missingBody && !lossyPlainTextFallback,
         missingBody,
         source,
-        degraded: lossyPlainTextFallback,
-        error: lossyPlainTextFallback ? "lossy-plain-text-fallback" : undefined,
+        degraded: lossyPlainTextFallback || lossyCommentFallback,
+        error: lossyPlainTextFallback ? "lossy-plain-text-fallback" : (lossyCommentFallback ? "comment-pruned-fallback" : undefined),
         markdown,
         resources,
       };
@@ -1948,6 +2606,35 @@ if (!window.__WIZ_EXPORT__) {
         resources: collector.refs,
       };
     }
+  }
+
+  async function exportNoteDirect(payload) {
+    const result = await convertNote(payload);
+    if (!result || !result.ok) return result;
+    const assetDirPath = String(payload.assetDirPath || "").replace(/[\\/]+$/g, "");
+    const resources = [];
+    for (const resource of result.resources || []) {
+      const record = { ...resource };
+      const base64 = record.base64;
+      delete record.base64;
+      if (record.ok && base64 && assetDirPath) {
+        try {
+          const filePath = assetDirPath + "/" + record.fileName;
+          await writeBase64OutputFile(filePath, base64);
+          record.path = filePath;
+        } catch (err) {
+          record.ok = false;
+          record.reason = err && err.message ? err.message : String(err);
+        }
+      }
+      resources.push(record);
+    }
+    return {
+      ...result,
+      source: result.source ? result.source + "-direct-write" : "direct-write",
+      resources,
+      directResourceWrite: true,
+    };
   }
 
   async function fetchResources(payload) {
@@ -2038,6 +2725,8 @@ if (!window.__WIZ_EXPORT__) {
   });
   helper.readSnapshot = readSnapshot;
   helper.convertNote = convertNote;
+  helper.exportNoteDirect = exportNoteDirect;
+  helper.waitForOpenCoEditNote = waitForOpenCoEditNote;
   helper.upgradeLegacyNote = upgradeLegacyNote;
   helper.fetchResources = fetchResources;
   helper.fetchLegacyAttachments = fetchLegacyAttachments;
@@ -2769,6 +3458,10 @@ function isLossyNoteRecord(note) {
   return !!(note && (note.degraded || /-plain-text$/.test(String(note.source || ""))));
 }
 
+function isPermanentFailureRecord(note) {
+  return !!(note && note.permanentFailure);
+}
+
 function noteModifiedMs(doc) {
   return Math.max(Number(doc.dataModified) || 0, Number(doc.infoModified) || 0);
 }
@@ -3103,6 +3796,94 @@ async function runAttachmentsOnly(args) {
   }
 }
 
+async function runWarm(args) {
+  const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
+  const manifest = await loadManifest(manifestPath);
+  if (!manifest) {
+    throw new Error(`Manifest not found: ${manifestPath}. Run export first.`);
+  }
+
+  const snapshot = await readSnapshot(args);
+  const indexes = buildIndexes(snapshot);
+  const docsByKey = new Map(indexes.docs.map((doc) => [noteKey(doc.kbGuid, doc.docGuid), doc]));
+
+  let selected = (manifest.notes || [])
+    .filter((note) => note && (!args.failedOnly || !note.ok))
+    .filter((note) => !args.only || note.docGuid === args.only)
+    .map((note) => docsByKey.get(noteKey(note.kbGuid, note.docGuid)))
+    .filter((doc) => doc && isCoEdit(doc.type));
+
+  if (args.limit) selected = selected.slice(0, args.limit);
+
+  log(args, `Warming ${selected.length} collaboration notes via note route`);
+
+  let warmed = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  await withBrowser(args, async (cdp) => {
+    for (let i = 0; i < selected.length; i += 1) {
+      const doc = selected[i];
+      const kb = indexes.kbsByGuid.get(doc.kbGuid) || {};
+      let alreadyLocal = false;
+      try {
+        const existing = await cdp.evaluate(`(async () => {
+          const blockCount = (value) => {
+            const candidates = [value];
+            if (value && typeof value === "object") {
+              candidates.push(value.docData, value.doc, value.data, value.document, value.content, value.payload);
+            }
+            for (const candidate of candidates) {
+              if (candidate && Array.isArray(candidate.blocks)) return candidate.blocks.length;
+            }
+            return 0;
+          };
+          if (!window.LiveEditor || !window.LiveEditor.getOfflineDocData) return false;
+          try {
+            const data = await window.LiveEditor.getOfflineDocData(${JSON.stringify(doc.kbGuid)}, ${JSON.stringify(doc.docGuid)});
+            return !!blockCount(data);
+          } catch {
+            return false;
+          }
+        })()`);
+        alreadyLocal = !!existing;
+      } catch {}
+      if (alreadyLocal) {
+        skipped += 1;
+        log(args, `[${i + 1}/${selected.length}] warm skip ${doc.title || doc.docGuid}: already local`);
+        continue;
+      }
+      const result = await warmCoEditDocByRoute(cdp, doc, kb, args).catch((err) => ({
+        ok: false,
+        error: err && err.message ? err.message : String(err),
+      }));
+      if (result && result.ok) {
+        warmed += 1;
+        log(args, `[${i + 1}/${selected.length}] warm ok ${doc.title || doc.docGuid}${result.blocks ? `, blocks ${result.blocks}` : ""}`);
+      } else {
+        failed += 1;
+        log(args, `[${i + 1}/${selected.length}] warm failed ${doc.title || doc.docGuid}: ${(result && (result.error || result.reason || result.syncError)) || "unknown"}`);
+      }
+    }
+  }, { includeResourceCache: false });
+
+  const summary = {
+    ok: true,
+    warmed,
+    skipped,
+    failed,
+    total: selected.length,
+    manifestPath,
+  };
+  if (args.json) console.log(JSON.stringify(summary, null, 2));
+  else {
+    console.log(`\nWarm done. Warmed: ${warmed}`);
+    if (skipped) console.log(`Skipped already local: ${skipped}`);
+    if (failed) console.log(`Warm failed: ${failed}`);
+    console.log(`Manifest: ${manifestPath}`);
+  }
+}
+
 async function runExport(args) {
   if (args.attachmentsOnly) {
     await runAttachmentsOnly(args);
@@ -3174,7 +3955,7 @@ async function runExport(args) {
 
   await fsp.mkdir(args.out, { recursive: true });
   const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
-  const existingManifest = (args.resume || args.failedOnly || args.degradedOnly) ? await loadManifest(manifestPath) : null;
+  const existingManifest = (args.resume || args.failedOnly || args.degradedOnly || args.only) ? await loadManifest(manifestPath) : null;
   if ((args.failedOnly || args.degradedOnly) && !existingManifest) {
     throw new Error(`${args.degradedOnly ? "--degraded-only" : "--failed-only"} requires an existing manifest: ${manifestPath}`);
   }
@@ -3183,9 +3964,16 @@ async function runExport(args) {
   const previousByDoc = new Map(previousNotes
     .filter((note) => note && note.docGuid)
     .map((note) => [note.docGuid, note]));
+  const permanentFailureGuids = new Set(previousNotes.filter((note) => isPermanentFailureRecord(note)).map((note) => note.docGuid));
+
+  if (!args.only && permanentFailureGuids.size) {
+    docs = docs.filter((doc) => !permanentFailureGuids.has(doc.docGuid));
+  }
 
   if (args.failedOnly) {
-    const failedGuids = new Set(previousNotes.filter((note) => note && !note.ok).map((note) => note.docGuid));
+    const failedGuids = new Set(previousNotes
+      .filter((note) => note && !note.ok && !isPermanentFailureRecord(note))
+      .map((note) => note.docGuid));
     docs = docs.filter((doc) => failedGuids.has(doc.docGuid));
   }
   if (args.degradedOnly) {
@@ -3336,20 +4124,47 @@ async function runExport(args) {
         const attachmentKey = `${doc.kbGuid}\u0000${doc.docGuid}`;
         const attachments = indexes.attachmentsByDoc.get(attachmentKey) || [];
         const kb = indexes.kbsByGuid.get(doc.kbGuid) || {};
-        const expression = `window.__WIZ_EXPORT__.convertNote(${JSON.stringify({
+        const useDirectResourceWrite = isCoEdit(doc.type) && !plan.plainTextAttempt;
+        const useOpenNoteContext = isCoEdit(doc.type) && !plan.plainTextAttempt && !!plan.forceOpenNoteContext;
+        const payload = {
           note: doc,
           kb,
           assetDirName: plan.assetDirName,
+          assetDirPath: plan.assetDir,
           fetchMissing: args.fetchMissing,
           downloadAttachments: args.downloadAttachments,
+          exportComments: false,
           simpleHtml: args.simpleHtml || !!plan.simpleHtmlAttempt,
           plainText: !!plan.plainTextAttempt,
+          preferOpenNoteEditor: useOpenNoteContext,
           convertTimeoutMs: args.noteTimeoutMs,
           resourceConcurrency: 4,
-        })})`;
+        };
+        const expression = `window.__WIZ_EXPORT__.${useDirectResourceWrite ? "exportNoteDirect" : "convertNote"}(${JSON.stringify(payload)})`;
         let result;
         const convertTimeoutMs = Math.max(args.noteTimeoutMs + 60000, args.noteTimeoutMs);
         try {
+          if (useOpenNoteContext) {
+            const ready = await openCoEditNoteRoute(cdp, doc, kb, args).catch((err) => ({
+              ok: false,
+              error: err && err.message ? err.message : String(err),
+            }));
+            if (ready && ready.ok) {
+              log(args, `[${displayIndex}/${plans.length}] note route ready for ${doc.title || doc.docGuid}: ${ready.source}${ready.blocks ? `, blocks ${ready.blocks}` : ""}`);
+            }
+            if (!ready || !ready.ok) {
+              const reason = ready && (ready.error || ready.reason || ready.syncError) ? (ready.error || ready.reason || ready.syncError) : "unknown";
+              const detail = ready ? JSON.stringify({
+                href: ready.href || "",
+                title: ready.title || "",
+                readyState: ready.readyState || "",
+                editorNodeCount: ready.editorNodeCount || 0,
+                offline: ready.offline || null,
+                openEditor: ready.openEditor || null,
+              }) : "";
+              log(args, `[${displayIndex}/${plans.length}] note route not fully ready for ${doc.title || doc.docGuid}: ${reason}${detail ? ` ${detail}` : ""}`);
+            }
+          }
           result = await evaluateWithTimeout(cdp, expression, convertTimeoutMs, `convert ${doc.docGuid}`);
         } catch (err) {
           if (!isEvaluateTimeout(err)) throw err;
@@ -3385,6 +4200,21 @@ async function runExport(args) {
 
         if (!result.ok) {
           noteRecord.error = result.error || (result.missingBody ? "missing-local-body" : "conversion-failed");
+          if (isCoEdit(doc.type) && noteRecord.error === "missing-local-body" && !plan.routeWarmAttempt) {
+            plan.routeWarmAttempt = true;
+            log(args, `[${displayIndex}/${plans.length}] warming ${doc.title || doc.docGuid} via note route after ${noteRecord.error}`);
+            const warm = await warmCoEditDocByRoute(cdp, doc, kb, args).catch((err) => ({
+              ok: false,
+              error: err && err.message ? err.message : String(err),
+            }));
+            if (warm && warm.ok) {
+              log(args, `[${displayIndex}/${plans.length}] retrying ${doc.title || doc.docGuid} after note-route warmup`);
+              continue;
+            }
+            if (warm && warm.error) {
+              log(args, `[${displayIndex}/${plans.length}] note-route warmup did not recover ${doc.title || doc.docGuid}: ${warm.error}`);
+            }
+          }
           if (!isCoEdit(doc.type) && !args.simpleHtml && !plan.simpleHtmlAttempt && /timed out/i.test(noteRecord.error)) {
             plan.simpleHtmlAttempt = true;
             log(args, `[${displayIndex}/${plans.length}] retrying ${doc.title || doc.docGuid} with simple HTML converter after ${noteRecord.error}`);
@@ -3424,6 +4254,8 @@ async function runExport(args) {
             const filePath = path.join(plan.assetDir, resource.fileName);
             await writeBase64File(filePath, resource.base64);
             resourceRecord.path = path.relative(args.out, filePath);
+          } else if (resource.path) {
+            resourceRecord.path = path.relative(args.out, resource.path);
           }
           noteRecord.resources.push(resourceRecord);
           if (resourceRecord.kind === "attachment") {
@@ -3490,6 +4322,7 @@ async function main() {
     if (!(await pathExists(args.liveEditor))) throw new Error(`LiveEditor bundle not found: ${args.liveEditor}`);
     if (args.command === "status") await runStatus(args);
     else if (args.command === "snapshot") await runSnapshot(args);
+    else if (args.command === "warm") await runWarm(args);
     else if (args.command === "upgrade-legacy") await runUpgradeLegacy(args);
     else if (args.command === "export") await runExport(args);
   } catch (err) {
