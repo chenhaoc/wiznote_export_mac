@@ -22,6 +22,8 @@ The exporter now treats note-body Markdown as the migration target and does not 
 
 Because comments are intentionally excluded, `RTL DDR利用率` and similar notes no longer need a special degraded fallback. For ordinary full-batch exports, note-route "open note first" prewarm is not part of the default strategy anymore; it remains only as a diagnostic path for unusual collaboration-note failures. When a collaboration resource is still missing after IndexedDB, Cache API, editor cache, and server fetch attempts, the exporter now falls back to the original WizNote profile cache on disk and restores the resource file directly from there.
 
+For old web-clipping notes, the effective target is also Markdown. In this data set, almost all web clips were already stored as `lite/markdown`, so `--web-clips-only` can usually reuse the normal Markdown export path directly. Only rare old `webnote` items need the legacy HTML upgrade or fallback path.
+
 ## Commands
 
 Check whether local data is ready:
@@ -63,6 +65,8 @@ node scripts/wiz-export.js export --out ./export --fetch-missing --attachments -
 
 Resume mode first uses the existing manifest, then falls back to the target Markdown frontmatter. A note is skipped only when the target `.md` exists, `wiznote_doc_guid` matches, and the exported `updated` timestamp is not older than the note's current modified time. If the frontmatter is missing, it falls back to file mtime. When combined with `--limit`, the limit applies after fresh notes are skipped, so it processes the next N unfinished notes.
 
+Manifest writes are protected by a short lock only around `read current -> merge -> write`. Conversion and resource downloads run outside the lock, so multiple narrow retry processes can run in parallel without holding the manifest for the whole export.
+
 For a first full pass, skip known slow web clippings and failed retries so ordinary notes can finish first:
 
 ```bash
@@ -73,6 +77,12 @@ Export only collaboration notes and skip legacy HTML notes:
 
 ```bash
 node scripts/wiz-export.js export --out ./export-coedit --coedit-only --attachments
+```
+
+Export only web-clipping notes:
+
+```bash
+node scripts/wiz-export.js export --out ./export-coedit --fetch-missing --resume --web-clips-only
 ```
 
 Add attachments to an existing export without reconverting note bodies. This downloads collaboration body links and legacy ordinary-note attachments into each note's `.assets/` directory:
@@ -121,6 +131,7 @@ Useful options:
 - `--skip-failed`: with `--resume`, skip notes already recorded as failed in the manifest
 - `--skip-web-clips`: skip notes with a web clipping type or original `http(s)` URL; with `--resume`, stale exported `.md` and `.assets/` for those notes are pruned from the output directory
 - `--attachments`: download collaboration-note file links and rewrite them into `.assets/`
+- `--web-clips-only`: export or verify only notes imported/clipped from web pages
 - `--attachments-only`: update an existing export directory with collaboration body-link attachments and legacy ordinary-note attachments
 - `--legacy-attachments-only`: update only legacy ordinary-note attachments in an existing export
 - `--body-attachments-only`: update only collaboration body-link attachments in an existing export
@@ -137,14 +148,14 @@ Useful options:
 
 As of 2026-04-27, the main `export-coedit` batch state is:
 
-- exported successfully: `2258`
+- exported successfully: `2518`
 - retryable failures: `0`
 - degraded exports: `0`
 - permanent failures: `1`
-- skipped web clips: `260`
+- skipped web clips: `0`
 - missing body resources: `0`
 - missing attachments: `0`
-- orphan markdown files: `1`
+- orphan markdown files: `1` (user-added local file, ignored by migration)
 - duplicate docGuid markdown files: `0`
 
 Current permanent failure list:
@@ -156,6 +167,10 @@ Current permanent failure list:
 - WizNote collaboration-note images may already exist in the original Electron profile cache even when the temporary Chromium profile cannot read them back through `window.caches`.
 - A note opening normally in the WizNote UI proves the body is local, but it does not prove the exporter can see the same image cache through the copied browser profile.
 - For stubborn local-missing resources, treat the original profile's `Service Worker/CacheStorage` and Electron `Cache` directories as the final local fallback, ahead of declaring the resource permanently missing.
+- Export speed is highly sensitive to local cache coverage. Once most note bodies and resources are already local, the batch shifts from server-backed recovery to mostly local reads and becomes much faster.
+- For this notebook set, web-clipping notes were overwhelmingly already `lite/markdown`. They behaved more like normal Markdown exports than like true HTML archival jobs.
+- A successful server-side legacy upgrade does not guarantee that the local snapshot immediately refreshes the note `type`. Do not block export on waiting for the local `type` field to flip if the remote HTML content already parses as `lite/markdown`.
+- Rare `simple-html-fallback` notes can still need manual spot checks. They usually export successfully, but page chrome or code-fence artifacts can leak into the Markdown and may need one-off cleanup.
 - After any large retry or repair batch, run `verify --rewrite-manifest` so the manifest reflects the exported files on disk rather than historical retry state.
 
 ## Obsidian and SiYuan Notes

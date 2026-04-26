@@ -23,9 +23,9 @@ function usage() {
   return `Usage:
   node scripts/wiz-export.js status [--json] [--profile PATH]
   node scripts/wiz-export.js snapshot [--json] [--profile PATH]
-  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--web-clips-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js warm --out DIR [--failed-only] [--limit N] [--only DOC_GUID]
-  node scripts/wiz-export.js verify --out DIR [--rewrite-manifest] [--coedit-only] [--only DOC_GUID]
+  node scripts/wiz-export.js verify --out DIR [--rewrite-manifest] [--coedit-only] [--web-clips-only] [--only DOC_GUID]
   node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
 
 Options:
@@ -39,6 +39,7 @@ Options:
   --skip-failed      With --resume, keep previous failed notes in the manifest and skip retrying them
   --skip-web-clips   Skip notes imported/clipped from web pages
   --coedit-only      Export only collaboration notes and skip legacy HTML notes
+  --web-clips-only   Export or verify only notes imported/clipped from web pages
   --rewrite-manifest With verify, rewrite _wiz_export_manifest.json from exported files
   --attachments      Download collaboration-note file links and rewrite them into .assets/
   --attachments-only Update an existing export directory with body-link and legacy attachments
@@ -77,6 +78,7 @@ function parseArgs(argv) {
     skipFailed: false,
     skipWebClips: false,
     coeditOnly: false,
+    webClipsOnly: false,
     rewriteManifest: false,
     downloadAttachments: false,
     attachmentsOnly: false,
@@ -107,6 +109,7 @@ function parseArgs(argv) {
     else if (a === "--skip-failed") args.skipFailed = true;
     else if (a === "--skip-web-clips") args.skipWebClips = true;
     else if (a === "--coedit-only") args.coeditOnly = true;
+    else if (a === "--web-clips-only") args.webClipsOnly = true;
     else if (a === "--rewrite-manifest") args.rewriteManifest = true;
     else if (a === "--attachments" || a === "--download-attachments") args.downloadAttachments = true;
     else if (a === "--attachments-only") {
@@ -151,6 +154,12 @@ function parseArgs(argv) {
   }
   if (args.legacyAttachmentsOnly && args.bodyAttachmentsOnly) {
     throw new Error("--legacy-attachments-only and --body-attachments-only cannot be used together");
+  }
+  if (args.webClipsOnly && args.skipWebClips) {
+    throw new Error("--web-clips-only and --skip-web-clips cannot be used together");
+  }
+  if (args.webClipsOnly && args.coeditOnly) {
+    throw new Error("--web-clips-only and --coedit-only cannot be used together");
   }
   return args;
 }
@@ -2341,16 +2350,32 @@ if (!window.__WIZ_EXPORT__) {
 
     const timeoutMs = Math.max(5000, Number(payload.convertTimeoutMs) || 90000);
     const inputHtml = processHtmlForMarkdown(downloaded.html);
-    const doc = await withTimeout(
-      window.LiveEditor.html2Doc(inputHtml, { convertFont: false, convertList: true }),
-      timeoutMs,
-      "html2Doc"
-    );
-    const markdownBody = await withTimeout(
-      window.LiveEditor.doc2markdown(doc, { keepImageSize: true, keepComments: false }),
-      timeoutMs,
-      "doc2markdown"
-    );
+    let markdownBody = "";
+    let convertSource = "live-editor-html2doc";
+    try {
+      const doc = await withTimeout(
+        window.LiveEditor.html2Doc(inputHtml, { convertFont: false, convertList: true }),
+        timeoutMs,
+        "html2Doc"
+      );
+      const normalizedDoc = normalizeCoEditDocData(doc);
+      if (!normalizedDoc || !Array.isArray(normalizedDoc.blocks)) {
+        throw new Error("html2Doc returned no blocks");
+      }
+      markdownBody = await withTimeout(
+        window.LiveEditor.doc2markdown(normalizedDoc, { keepImageSize: true, keepComments: false }),
+        timeoutMs,
+        "doc2markdown"
+      );
+    } catch (_err) {
+      convertSource = "simple-html-fallback";
+      const collector = createResourceCollector("index_files");
+      markdownBody = simpleHtmlToMarkdown(inputHtml, "index_files", collector.reserve);
+      if (!String(markdownBody || "").trim()) {
+        markdownBody = roughHtmlToMarkdown(inputHtml, "index_files", collector.reserve);
+      }
+      if (!String(markdownBody || "").trim()) throw _err;
+    }
     const escapedTitle = escapeMarkdownTitle(stripMarkdownExt(note.title || info.title || "Untitled"));
     const titleLine = "# " + escapedTitle;
     let markdown = String(markdownBody || "").trim();
@@ -2385,7 +2410,7 @@ if (!window.__WIZ_EXPORT__) {
       ok: true,
       skipped: false,
       dryRun,
-      source: downloaded.source,
+      source: convertSource === "live-editor-html2doc" ? downloaded.source : (downloaded.source + "-" + convertSource),
       fromType: note.type || "",
       toType: "lite/markdown",
       title: note.title || "",
@@ -3985,6 +4010,7 @@ async function runVerify(args) {
   let docs = sortDocsByTree(indexes.docs);
   if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
   if (args.coeditOnly) docs = docs.filter((doc) => isCoEdit(doc.type));
+  if (args.webClipsOnly) docs = docs.filter((doc) => isWebClipDoc(doc));
 
   await fsp.mkdir(args.out, { recursive: true });
   const manifestPath = path.join(args.out, "_wiz_export_manifest.json");
@@ -4498,6 +4524,7 @@ async function runExport(args) {
       return String(a.title || "").localeCompare(String(b.title || ""));
     });
     if (args.coeditOnly) docs = docs.filter((doc) => isCoEdit(doc.type));
+    if (args.webClipsOnly) docs = docs.filter((doc) => isWebClipDoc(doc));
     if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
     if (args.skipWebClips) docs = docs.filter((doc) => !isWebClipDoc(doc));
     blockedMissing = docs.filter((doc) => !noteHasLocalBody(doc, indexes) && !args.fetchMissing);
@@ -4529,7 +4556,11 @@ async function runExport(args) {
   const skippedForWebClips = [];
   if (args.skipWebClips) {
     const allSelectedDocs = sortDocsByTree(indexes.docs)
-      .filter((doc) => (!args.coeditOnly || isCoEdit(doc.type)) && (!args.only || doc.docGuid === args.only));
+      .filter((doc) =>
+        (!args.coeditOnly || isCoEdit(doc.type)) &&
+        (!args.webClipsOnly || isWebClipDoc(doc)) &&
+        (!args.only || doc.docGuid === args.only)
+      );
     for (const doc of allSelectedDocs) {
       if (isWebClipDoc(doc)) skippedForWebClips.push(doc);
     }
