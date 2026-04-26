@@ -1,0 +1,14 @@
+{
+  "name": "wiznote-export-mac",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Export WizNote desktop notes to Markdown while preserving folder structure.",
+  "type": "commonjs",
+  "scripts": {
+    "status": "node scripts/wiz-export.js status",
+    "export": "node scripts/wiz-export.js export"
+  },
+  "engines": {
+    "node": ">=25"
+  }
+}
