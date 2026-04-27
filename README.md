@@ -1,104 +1,104 @@
-# WizNote Markdown Export
+# WizNote Markdown 导出工具
 
-Export WizNote desktop notes to Markdown on macOS while preserving folder structure and local resources.
+在 macOS 上将为知笔记桌面端笔记导出为 Markdown，并尽量保留目录结构与本地资源。
 
-This project is designed for migration out of WizNote into tools such as Obsidian or SiYuan. It works against the local WizNote desktop profile and reuses parts of WizNote's own local data model and editor conversion flow.
+这个项目的目标是帮助用户从为知笔记迁移到 Obsidian、思源笔记等其他工具。它直接读取本地为知桌面端 profile，并复用为知本地数据结构与部分编辑器转换链路。
 
-Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
+English documentation: [README.en.md](README.en.md)
 
-## Status
+## 项目状态
 
-- macOS only
-- works with the WizNote desktop app profile
-- not an official WizNote tool
-- built from observed WizNote desktop behavior, so future app updates can break it
-- tested against WizNote for macOS `0.1.107`
+- 仅支持 macOS
+- 面向为知笔记桌面端本地 profile
+- 不是为知官方工具
+- 依赖对为知桌面端行为的观察与复用，未来版本更新可能导致失效
+- 当前测试版本：WizNote for macOS `0.1.107`
 
-## What It Exports
+## 可导出的内容
 
-- note tree as directories
-- note body as Markdown
-- body images/resources into a sibling `*.assets/` directory
-- collaboration note body links as local attachments
-- export manifests for resume, retry, and verification
+- 笔记目录树
+- 笔记正文 Markdown
+- 正文图片/资源到同级 `*.assets/` 目录
+- 协作笔记中的正文文件链接附件
+- 用于续跑、重试、校验的 manifest
 
-The primary output of this project is Markdown. Raw HTML is not the primary migration artifact.
+本项目的主要迁移产物是 Markdown，不以原始 HTML 作为主要输出。
 
-> ⚠️ **Warning**
-> `upgrade-legacy` is a write-back operation. It converts legacy HTML notes into `lite/markdown` and uploads the converted result back into WizNote. This changes the original note type and can change the original note content shape. Use normal `export` if you want Markdown output without modifying source notes.
+> ⚠️ **重要警告**
+> `upgrade-legacy` 是一个会写回为知的操作。它会把旧 HTML 笔记转换成 `lite/markdown`，再把转换结果上传回为知。这会改变用户原笔记的类型，也可能改变原笔记的内容形态。如果你只想导出 Markdown，而不改动为知中的源笔记，应当使用普通 `export`。
 
-## Current Export Policy
+## 当前导出策略
 
-- Normal `export` is read-only to your WizNote data. For old HTML notes and older `webnote` clippings, it can directly convert the current note content into exported Markdown without writing back to WizNote.
-- `upgrade-legacy` is optional and destructive to source data shape. It rewrites old HTML notes inside WizNote as `lite/markdown`.
-- Collaboration comments are intentionally not exported.
-- Markdown is the target format, including for old web-clipping notes.
-- Missing collaboration resources can fall back to the original WizNote profile cache on disk.
-- Export manifests are merged with a short lock so narrow retry jobs can run in parallel.
+- 普通 `export` 对为知源数据是只读的。对于旧 HTML 笔记和较老的 `webnote` 剪藏，它可以直接把当前笔记内容转换成导出的 Markdown，而不会写回为知。
+- `upgrade-legacy` 是可选步骤，但它会改写为知中的旧 HTML 笔记，把它们重写成 `lite/markdown`。
+- 协作评论默认不导出。
+- 所有导出都以 Markdown 为目标格式，包括旧网页剪藏。
+- 协作笔记缺失资源时，可以回退到原始 WizNote profile 的本地缓存。
+- manifest 采用短锁合并，方便多进程窄范围重试。
 
-## Supported Note Shapes
+## 支持的笔记形态
 
-- collaboration notes
-- `lite/markdown` notes
-- legacy HTML notes, through direct HTML-to-Markdown export
-- web-clipping notes, including older `webnote` items
-- optional pre-export write-back upgrade for old ordinary HTML notes via `upgrade-legacy`
+- 协作笔记
+- `lite/markdown` 笔记
+- 旧 HTML 笔记，可直接导出为 Markdown
+- 网页剪藏笔记，包括较老的 `webnote` 项
+- 可选的旧普通 HTML 笔记写回升级流程：`upgrade-legacy`
 
-Very old notes may still need fallback conversion or manual review.
+极旧的笔记仍可能需要 fallback 转换或人工检查。
 
-## Quick Start
+## 快速开始
 
-Requirements:
+环境要求：
 
 - macOS
-- WizNote desktop app installed
+- 已安装为知笔记桌面端
 - Node.js 24+
-- Google Chrome, Chromium, or Microsoft Edge installed locally
+- 本机已安装 Google Chrome、Chromium 或 Microsoft Edge
 
-Other Chromium-based browsers can still work, but you must set `CHROME_PATH` to the browser binary path because auto-discovery only checks the three apps above.
-
-Check local readiness:
+检查本地准备情况：
 
 ```bash
 npm run status
 ```
 
-Before a large export, open WizNote `Settings -> Sync Settings` and set both `Offline Personal Notes` and `Offline Group Notes (Legacy Notes)` to `All Notes`. In the tested build, those offline settings explicitly exclude attachments.
+如果你用的是其他 Chromium 内核浏览器，也可以工作，但需要手工设置 `CHROME_PATH` 指向浏览器二进制路径，因为脚本的自动发现目前只检查上面这三个应用。
 
-After changing those settings, wait for WizNote's own background sync to catch up before starting a large export. In practice, WizNote's offline sync can be slow even when it is working normally, so users should expect to wait patiently at this stage. Local fully-synced exports are usually much faster and more reliable. `--fetch-missing` can bypass part of that wait, but it is a fallback path and usually less stable than exporting after local sync finishes.
+在大批量导出之前，先到为知 `设置 -> 同步设置` 中，将 `离线个人笔记` 和 `离线群组笔记（老笔记）` 都设成 `全部笔记`。当前测试版本的界面说明已经明确写明：这两项设置 **不含附件**。
 
-Run a first export:
+设置完成后，建议先等待为知自己的后台同步把本地离线正文同步到位，再开始大批量导出。实际使用中，为知的离线同步即使在正常工作时也可能很慢，所以用户需要对这一步有耐心。**本地已同步完成** 的导出通常会明显更快，也更稳定。`--fetch-missing` 可以在不等待的情况下补抓缺失正文，但它本质上是补救路径，成功率和稳定性通常不如本地同步完成后的导出。
+
+执行首次导出：
 
 ```bash
 node scripts/wiz-export.js export --out ./export --fetch-missing
 ```
 
-Resume an existing export:
+续跑已有导出：
 
 ```bash
 node scripts/wiz-export.js export --out ./export --fetch-missing --attachments --resume
 ```
 
-Verify and rebuild the manifest from files on disk:
+基于磁盘文件校验并重建 manifest：
 
 ```bash
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
-## Output Layout
+## 输出结构
 
-Each note is written as:
+每篇笔记的输出形式：
 
 ```text
-Category/Subcategory/Note.md
-Category/Subcategory/Note.assets/
+分类/子分类/笔记.md
+分类/子分类/笔记.assets/
 ```
 
-This keeps Markdown, images, and local file links together so a subtree can be copied or archived without breaking relative links.
+这样 Markdown、图片和本地文件链接会放在一起，复制或归档一个子目录时不会破坏相对路径。
 
-## Documentation
+## 文档索引
 
-- [README.zh-CN.md](README.zh-CN.md)
+- [README.en.md](README.en.md)
 - [docs/USAGE.md](docs/USAGE.md)
 - [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md)
 - [docs/POST_IMPORT.md](docs/POST_IMPORT.md)
