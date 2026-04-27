@@ -3289,6 +3289,18 @@ function stripLeadingTitleHeading(markdown, title) {
   return lines.join("\n").replace(/^\n+/, "");
 }
 
+function stripWholeBodyPlainTextFence(markdown) {
+  const text = String(markdown || "").replace(/^\uFEFF/, "");
+  const lines = text.split(/\r?\n/);
+  let start = 0;
+  while (start < lines.length && !lines[start].trim()) start += 1;
+  if (start >= lines.length || lines[start].trim() !== "```Plain Text") return text;
+  let end = lines.length - 1;
+  while (end >= 0 && !lines[end].trim()) end -= 1;
+  if (end <= start || lines[end].trim() !== "```") return text;
+  return lines.slice(start + 1, end).join("\n").replace(/^\n+/, "");
+}
+
 function noteOutputPlan(docs, outDir) {
   const used = new Map();
   return docs.map((doc) => {
@@ -4884,7 +4896,8 @@ async function runExport(args) {
         }
 
         const bodyAttachments = (result.resources || []).filter((resource) => resource.kind === "attachment");
-        const normalizedBody = stripLeadingTitleHeading(String(result.markdown || ""), doc.title || "");
+        const plainFenceStrippedBody = stripWholeBodyPlainTextFence(String(result.markdown || ""));
+        const normalizedBody = stripLeadingTitleHeading(plainFenceStrippedBody, doc.title || "");
         const markdown = frontmatter(doc, attachments, bodyAttachments) + normalizedBody.trimEnd() + "\n";
         await fsp.mkdir(path.dirname(plan.filePath), { recursive: true });
         await fsp.writeFile(plan.filePath, markdown, "utf8");
