@@ -2,5 +2,6 @@
 node_modules/
 export/
 export-coedit/
+export-wiznotes/
 tmp/
 *.log

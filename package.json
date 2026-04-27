@@ -6,9 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "status": "node scripts/wiz-export.js status",
-    "export": "node scripts/wiz-export.js export"
+    "export": "node scripts/wiz-export.js export",
+    "verify": "node scripts/wiz-export.js verify"
   },
   "engines": {
-    "node": ">=25"
+    "node": ">=24"
   }
 }
