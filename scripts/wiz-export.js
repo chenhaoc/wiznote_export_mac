@@ -7,6 +7,7 @@ const path = require("path");
 const os = require("os");
 const http = require("http");
 const net = require("net");
+const readline = require("readline");
 const { spawn, execFile } = require("child_process");
 const { promisify } = require("util");
 
@@ -26,7 +27,7 @@ function usage() {
   node scripts/wiz-export.js export --out DIR [--wait] [--allow-partial] [--fetch-missing] [--resume] [--failed-only] [--degraded-only] [--skip-failed] [--skip-web-clips] [--coedit-only] [--web-clips-only] [--attachments] [--attachments-only] [--legacy-attachments-only] [--body-attachments-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js warm --out DIR [--failed-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js verify --out DIR [--rewrite-manifest] [--coedit-only] [--web-clips-only] [--only DOC_GUID]
-  node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID]
+  node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID] [--yes]
 
 Options:
   --out DIR          Export output directory. Default: ./export
@@ -48,6 +49,7 @@ Options:
   --body-attachments-only
                      With --attachments-only, update only collaboration body-link attachments
   --dry-run          Convert legacy notes and report what would be uploaded without writing to WizNote
+  --yes              Skip the destructive-operation confirmation for upgrade-legacy
   --simple-html      Use a faster, lower-fidelity converter for standard HTML notes
   --wait             Poll until local note bodies look complete
   --poll-ms N        Poll interval for --wait. Default: 60000
@@ -85,6 +87,7 @@ function parseArgs(argv) {
     legacyAttachmentsOnly: false,
     bodyAttachmentsOnly: false,
     dryRun: false,
+    yes: false,
     simpleHtml: false,
     wait: false,
     pollMs: 60000,
@@ -127,6 +130,7 @@ function parseArgs(argv) {
       args.downloadAttachments = true;
     }
     else if (a === "--dry-run") args.dryRun = true;
+    else if (a === "--yes") args.yes = true;
     else if (a === "--simple-html") args.simpleHtml = true;
     else if (a === "--wait") args.wait = true;
     else if (a === "--json") args.json = true;
@@ -407,7 +411,43 @@ async function findChrome() {
   for (const candidate of candidates) {
     if (await pathExists(candidate)) return candidate;
   }
-  throw new Error("Chrome/Chromium not found. Set CHROME_PATH to a Chromium-based browser binary.");
+  throw new Error(
+    "Chrome/Chromium not found. Auto-detection supports Google Chrome, Chromium, and Microsoft Edge. Set CHROME_PATH for other Chromium-based browsers."
+  );
+}
+
+async function askForLine(prompt) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    return await new Promise((resolve) => rl.question(prompt, resolve));
+  } finally {
+    rl.close();
+  }
+}
+
+async function confirmUpgradeLegacy(args) {
+  if (args.yes) return;
+  const confirmationToken = "upgrade-legacy";
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      "upgrade-legacy will modify notes inside WizNote by converting old HTML notes to lite/markdown and uploading them back. Re-run with --yes after reviewing the warning. " +
+      "upgrade-legacy 会通过将旧 HTML 笔记转换为 lite/markdown 并回传到为知，从而修改为知中的原笔记。请先阅读风险提示，再使用 --yes 重跑。"
+    );
+  }
+  console.log("");
+  console.log("WARNING / 重要警告: upgrade-legacy writes back to WizNote / 这个命令会写回为知。");
+  console.log("- It converts legacy HTML notes into lite/markdown. / 它会把旧 HTML 笔记转换成 lite/markdown。");
+  console.log("- It uploads the converted result back through the WizNote API. / 它会通过为知 API 把转换结果上传回为知。");
+  console.log("- This changes the original note type and can change the original note content shape. / 这会改变原笔记类型，也可能改变原笔记的内容形态。");
+  console.log("- Use export if you only want Markdown output without modifying source notes. / 如果你只想导出 Markdown 而不改动源笔记，请使用 export。");
+  console.log("");
+  const answer = (await askForLine(`Type '${confirmationToken}' to continue / 输入 '${confirmationToken}' 继续: `)).trim();
+  if (answer !== confirmationToken) {
+    throw new Error("upgrade-legacy cancelled: confirmation token did not match. / upgrade-legacy 已取消：确认口令不匹配。");
+  }
 }
 
 async function copyProfile(sourceProfile, targetProfile, options = {}) {
@@ -3556,6 +3596,7 @@ function makeUpgradeRecord(doc, result) {
 }
 
 async function runUpgradeLegacy(args) {
+  await confirmUpgradeLegacy(args);
   const snapshot = await readSnapshot(args);
   const status = statusFromSnapshot(snapshot);
   const indexes = buildIndexes(snapshot);
