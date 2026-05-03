@@ -135,6 +135,12 @@ Sync Finder birth/modified times from note frontmatter:
 python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
+Repeated runs automatically skip files that are already aligned. To inspect only Markdown files changed locally within the last 30 days:
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 ../export-wiznotes
+```
+
 ## Output Layout
 
 Each note is written as:

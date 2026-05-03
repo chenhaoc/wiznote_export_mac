@@ -135,6 +135,12 @@ node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
 python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
+重复运行时会自动跳过已经对齐的文件。只想检查最近改过的本地 Markdown 时，可以加：
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 ../export-wiznotes
+```
+
 ## 输出结构
 
 每篇笔记的输出形式：

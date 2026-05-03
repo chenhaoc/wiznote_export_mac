@@ -93,6 +93,12 @@ node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
 python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
+重复运行时会自动跳过已经对齐的文件。只想检查最近 30 天内本地改过的 Markdown 时，可以加：
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 ../export-wiznotes
+```
+
 ## 常见流程
 
 ### 1. 首次全量迁移
@@ -156,6 +162,7 @@ node scripts/wiz-export.js upgrade-legacy --out ./export --resume --yes
 - `--note-timeout-ms N`：单篇笔记转换超时
 - `--attachment-timeout-ms N`：单个附件/资源下载超时
 - `--mode conservative`：用于 `sync_note_file_times.py`，优先使用 `date modified` / `date created`
+- `--modified-within-days N`：用于 `sync_note_file_times.py`，只检查当前本地 mtime 在最近 N 天内的文件
 
 ## 输出文件
 

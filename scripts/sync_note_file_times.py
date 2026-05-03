@@ -12,12 +12,16 @@
    python3 scripts/sync_note_file_times.py export-wiznotes/研究生项目
 4. 正式处理时打印每个文件：
    python3 scripts/sync_note_file_times.py --verbose export-wiznotes
+5. 只处理最近 30 天内本地改过的 Markdown：
+   python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 export-wiznotes
 
 说明：
 - `created` 用于回写 Finder 里的创建时间（birth time）
 - 默认使用 `updated` 回写文件修改时间（mtime）
 - `--mode conservative` 时，优先使用 `date modified` 回写 mtime，
   缺失时再退回 `updated`
+- `--modified-within-days` 基于当前本地文件 mtime 预筛选，
+  用来避开全量扫描时的正文解析与时间回写
 - 仅处理 `.md` 文件
 - 没有可用时间字段的文件会跳过
 """
@@ -25,15 +29,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FIELD_RE = re.compile(
     r'(?mi)^(created|updated|date created|date modified):\s*"?([^"\n]+)"?\s*$'
 )
@@ -47,6 +52,16 @@ class NoteTimes:
     date_modified: datetime | None
 
 
+def positive_days(raw_value: str) -> float:
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid day count: {raw_value}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("Day count must be greater than 0.")
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Sync macOS file birth/modified times from note frontmatter.",
@@ -55,6 +70,7 @@ def parse_args() -> argparse.Namespace:
             "  python3 scripts/sync_note_file_times.py --dry-run export-wiznotes\n"
             "  python3 scripts/sync_note_file_times.py export-wiznotes/研究生项目\n"
             "  python3 scripts/sync_note_file_times.py --verbose export-wiznotes\n"
+            "  python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 export-wiznotes\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -82,20 +98,29 @@ def parse_args() -> argparse.Namespace:
             "conservative: prefer date modified, fallback to updated."
         ),
     )
+    parser.add_argument(
+        "--modified-within-days",
+        type=positive_days,
+        metavar="DAYS",
+        help=(
+            "Only inspect files whose current local mtime is within the last N days. "
+            "This pre-filter uses the existing filesystem mtime before syncing."
+        ),
+    )
     return parser.parse_args()
 
 
 def iter_markdown_files(paths: list[str]) -> list[Path]:
-    files: list[Path] = []
+    files: set[Path] = set()
     for raw_path in paths:
         path = Path(raw_path)
         if path.is_file():
             if path.suffix.lower() == ".md":
-                files.append(path)
+                files.add(path)
             continue
         if path.is_dir():
-            files.extend(sorted(path.rglob("*.md")))
-    return sorted(set(files))
+            files.update(path.rglob("*.md"))
+    return sorted(files)
 
 
 def parse_iso_datetime(raw_value: str) -> datetime:
@@ -136,10 +161,27 @@ def parse_local_datetime(raw_value: str) -> datetime:
     raise ValueError(f"Unsupported local datetime format: {raw_value}")
 
 
+def read_frontmatter_block(path: Path) -> str | None:
+    total_chars = 0
+    frontmatter_lines: list[str] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        first_line = handle.readline()
+        if first_line.strip() != "---":
+            return None
+        total_chars += len(first_line)
+        for line in handle:
+            total_chars += len(line)
+            if line.strip() == "---":
+                return "".join(frontmatter_lines)
+            frontmatter_lines.append(line)
+            if total_chars >= 64 * 1024:
+                break
+    return None
+
+
 def extract_note_times(path: Path) -> NoteTimes:
-    content = path.read_text(encoding="utf-8", errors="ignore")
-    match = FRONTMATTER_RE.match(content)
-    if not match:
+    frontmatter = read_frontmatter_block(path)
+    if not frontmatter:
         return NoteTimes(created=None, updated=None, date_created=None, date_modified=None)
 
     # Only inspect the frontmatter block at the top of the note.
@@ -147,7 +189,7 @@ def extract_note_times(path: Path) -> NoteTimes:
     updated: datetime | None = None
     date_created: datetime | None = None
     date_modified: datetime | None = None
-    for field, value in FIELD_RE.findall(match.group(1)):
+    for field, value in FIELD_RE.findall(frontmatter):
         normalized = field.lower()
         if normalized == "created":
             created = parse_iso_datetime(value)
@@ -175,6 +217,12 @@ def choose_modified_time(note_times: NoteTimes, mode: str) -> datetime | None:
     return note_times.updated
 
 
+def same_filesystem_second(current_timestamp: float | None, target_dt: datetime | None) -> bool:
+    if current_timestamp is None or target_dt is None:
+        return False
+    return int(current_timestamp) == int(target_dt.timestamp())
+
+
 def set_birth_time(path: Path, dt: datetime) -> None:
     # `SetFile -d` updates the macOS birth time shown by Finder.
     subprocess.run(
@@ -188,17 +236,10 @@ def set_birth_time(path: Path, dt: datetime) -> None:
     )
 
 
-def set_modified_time(path: Path, dt: datetime) -> None:
-    # `touch -t` updates the filesystem modification time.
-    subprocess.run(
-        [
-            "touch",
-            "-t",
-            dt.strftime("%Y%m%d%H%M.%S"),
-            str(path),
-        ],
-        check=True,
-    )
+def set_modified_time(path: Path, dt: datetime, atime_ns: int) -> None:
+    # `os.utime` avoids spawning `touch` for every file.
+    target_mtime_ns = int(dt.timestamp()) * 1_000_000_000
+    os.utime(path, ns=(atime_ns, target_mtime_ns))
 
 
 def main() -> int:
@@ -209,11 +250,21 @@ def main() -> int:
         return 1
 
     changed = 0
+    age_filtered = 0
+    already_synced = 0
     skipped = 0
     failed = 0
+    modified_since_ts = None
+    if args.modified_within_days is not None:
+        modified_since_ts = time.time() - (args.modified_within_days * 24 * 60 * 60)
 
     for path in files:
         try:
+            current_stat = path.stat()
+            if modified_since_ts is not None and current_stat.st_mtime < modified_since_ts:
+                age_filtered += 1
+                continue
+
             note_times = extract_note_times(path)
             created_dt = choose_created_time(note_times)
             modified_dt = choose_modified_time(note_times, args.mode)
@@ -221,20 +272,29 @@ def main() -> int:
                 skipped += 1
                 continue
 
-            created_text = created_dt.isoformat() if created_dt else "-"
-            updated_text = modified_dt.isoformat() if modified_dt else "-"
+            needs_created = created_dt is not None and not same_filesystem_second(
+                getattr(current_stat, "st_birthtime", None), created_dt
+            )
+            needs_modified = modified_dt is not None and not same_filesystem_second(
+                current_stat.st_mtime, modified_dt
+            )
+            if not needs_created and not needs_modified:
+                already_synced += 1
+                continue
 
             if args.dry_run:
                 print(f"DRY {path}")
-                print(f"  created -> {created_text}")
-                print(f"  updated -> {updated_text}")
+                if needs_created and created_dt is not None:
+                    print(f"  created -> {created_dt.isoformat()}")
+                if needs_modified and modified_dt is not None:
+                    print(f"  updated -> {modified_dt.isoformat()}")
                 changed += 1
                 continue
 
-            if created_dt:
+            if needs_created and created_dt is not None:
                 set_birth_time(path, created_dt)
-            if modified_dt:
-                set_modified_time(path, modified_dt)
+            if needs_modified and modified_dt is not None:
+                set_modified_time(path, modified_dt, current_stat.st_atime_ns)
             if args.verbose:
                 print(f"OK  {path}")
             changed += 1
@@ -243,7 +303,15 @@ def main() -> int:
             failed += 1
 
     print(
-        f"Summary: scanned={len(files)} changed={changed} skipped={skipped} failed={failed}",
+        (
+            "Summary: "
+            f"scanned={len(files)} "
+            f"age_filtered={age_filtered} "
+            f"changed={changed} "
+            f"already_synced={already_synced} "
+            f"skipped={skipped} "
+            f"failed={failed}"
+        ),
         file=sys.stderr if failed else sys.stdout,
     )
     return 1 if failed else 0

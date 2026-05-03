@@ -93,6 +93,12 @@ Sync Finder birth/modified times from note frontmatter:
 python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
+Repeated runs automatically skip files that are already aligned. To inspect only Markdown files changed locally within the last 30 days:
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative --modified-within-days 30 ../export-wiznotes
+```
+
 ## Common Workflows
 
 ### 1. First full migration
@@ -156,6 +162,7 @@ Use `upgrade-legacy` only when you explicitly want to change the source notes in
 - `--note-timeout-ms N`: per-note conversion timeout
 - `--attachment-timeout-ms N`: per attachment/resource timeout
 - `--mode conservative`: for `sync_note_file_times.py`, prefer `date modified` / `date created` when present
+- `--modified-within-days N`: for `sync_note_file_times.py`, only inspect files whose current local mtime is within the last N days
 
 ## Output Files
 
