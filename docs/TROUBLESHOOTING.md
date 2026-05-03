@@ -93,3 +93,17 @@ This rebuilds the manifest from actual Markdown files and local assets on disk. 
 ## 8. Parallel retries and manifest safety
 
 Manifest writes use a short lock only during merge/write. The heavy work runs outside the lock. This allows multiple narrow retry processes to coexist without holding the manifest for the whole export.
+
+## 9. Missing-resource scan reports moved paths
+
+`find-missing-local-resources.js` can report `moved` paths, which means the resource still exists but no longer sits beside the Markdown note.
+
+You can repair that with:
+
+```bash
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+Use `--dry-run` first if you want to preview the move list. The script writes `find-missing-local-resources.log` in the export root by default.
+
+If the log says `ambiguous moved match`, there are multiple same-named candidates and the script will skip that case on purpose.

@@ -85,26 +85,54 @@ node scripts/wiz-export.js export --out ./export --fetch-missing --attachments -
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
-## 维护脚本
+## 导出后整理
 
-导出后的本地整理和校验可以直接用这些脚本：
+这些脚本适合“导出已经完成，但还想继续整理导出结果”的场景。
+
+默认假设：
+
+- 当前目录是 `wiznote_export_mac/`
+- 导出的 vault 位于 `../export-wiznotes`
+
+### `coedit-attachments`
+
+查看协作笔记里的附件元数据：
 
 ```bash
 npm run coedit-attachments
-npm run clean:obsidian-tags
-npm run fix:wiz-links
-npm run find:missing-resources
 ```
 
-- `coedit-attachments`：列出协作笔记里的 office/embed 附件元数据
-- `clean:obsidian-tags`：清理误识别的 Obsidian 标签和部分 frontmatter 噪声
-- `fix:wiz-links`：修正导出后带 `id=GUID` 的损坏 wikilink
-- `find:missing-resources`：扫描导出目录里缺失或位置变动的本地资源引用
+### `fix:wiz-links`
 
-如果需要修正 moved 资源目录，可以直接运行：
+修正仍然带 `id=GUID` 的损坏 wikilink：
 
 ```bash
+npm run fix:wiz-links
+```
+
+### `clean:obsidian-tags`
+
+清理误识别的 Obsidian 标签和 frontmatter 噪声：
+
+```bash
+npm run clean:obsidian-tags
+```
+
+### `find:missing-resources`
+
+扫描缺失资源和 moved 资源：
+
+```bash
+npm run find:missing-resources
 node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+### `sync_note_file_times.py`
+
+按笔记 frontmatter 回写 Finder 创建时间和修改时间：
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
 ## 输出结构

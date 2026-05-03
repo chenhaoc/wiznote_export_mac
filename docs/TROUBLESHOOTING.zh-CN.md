@@ -95,3 +95,17 @@ node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ## 8. 并行重试与 manifest 安全
 
 manifest 只在 `读取当前内容 -> 合并 -> 写回` 这一小段时间内加短锁，真正耗时的转换和下载都在锁外执行。这样可以并行跑多个小范围重试，而不会整轮导出都占着锁。
+
+## 9. 缺失资源扫描报告了 moved 路径
+
+`find-missing-local-resources.js` 可能会报告 `moved` 路径，意思是资源还在，但已经不在 Markdown 同级目录下。
+
+可以直接修正：
+
+```bash
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+建议先加 `--dry-run` 预览。脚本默认会在导出根目录里写 `find-missing-local-resources.log`。
+
+如果日志里出现 `ambiguous moved match`，说明有多个同名候选目录。脚本会故意跳过这种情况，避免搬错目录。

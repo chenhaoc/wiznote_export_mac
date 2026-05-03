@@ -43,6 +43,56 @@ node scripts/wiz-export.js export --out ./export --fetch-missing --attachments -
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
+## 导出后整理
+
+这些脚本适合“导出已经完成，但还想继续整理导出结果”的场景。
+
+默认假设：
+
+- 当前目录是 `wiznote_export_mac/`
+- 导出的 vault 位于 `../export-wiznotes`
+
+### `coedit-attachments`
+
+查看协作笔记里的附件元数据：
+
+```bash
+npm run coedit-attachments
+```
+
+### `fix:wiz-links`
+
+修正仍然带 `id=GUID` 的损坏 wikilink：
+
+```bash
+npm run fix:wiz-links
+```
+
+### `clean:obsidian-tags`
+
+清理误识别的标签和 frontmatter 噪声：
+
+```bash
+npm run clean:obsidian-tags
+```
+
+### `find:missing-resources`
+
+扫描缺失资源和 moved 资源：
+
+```bash
+npm run find:missing-resources
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+### `sync_note_file_times.py`
+
+按笔记 frontmatter 回写 Finder 创建时间和修改时间：
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
+```
+
 ## 常见流程
 
 ### 1. 首次全量迁移
@@ -105,6 +155,7 @@ node scripts/wiz-export.js upgrade-legacy --out ./export --resume --yes
 - `--limit N`：限制处理数量
 - `--note-timeout-ms N`：单篇笔记转换超时
 - `--attachment-timeout-ms N`：单个附件/资源下载超时
+- `--mode conservative`：用于 `sync_note_file_times.py`，优先使用 `date modified` / `date created`
 
 ## 输出文件
 

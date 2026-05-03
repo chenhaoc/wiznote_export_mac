@@ -32,3 +32,4 @@ Suggestions:
 
 - Keep one immutable export snapshot as a backup until the target note app has been validated.
 - Run note-level spot checks before any bulk rename, move, or cleanup inside the target app.
+- If Finder birth/modified times matter to your workflow, you can sync them from note frontmatter with `python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes`.

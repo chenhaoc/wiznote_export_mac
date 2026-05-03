@@ -85,26 +85,54 @@ Verify and rebuild the manifest from files on disk:
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
-## Maintenance Scripts
+## Post-Export Cleanup
 
-For post-export cleanup and validation, these scripts are available:
+These scripts are for the stage after export, when you want to clean up or validate the exported vault.
+
+Default assumptions:
+
+- current directory: `wiznote_export_mac/`
+- exported vault: `../export-wiznotes`
+
+### `coedit-attachments`
+
+Inspect attachment metadata from collaboration notes:
 
 ```bash
 npm run coedit-attachments
-npm run clean:obsidian-tags
-npm run fix:wiz-links
-npm run find:missing-resources
 ```
 
-- `coedit-attachments`: list office/embed attachment metadata from collaboration notes
-- `clean:obsidian-tags`: clean misdetected Obsidian tags and some frontmatter noise
-- `fix:wiz-links`: rewrite broken wikilinks that still contain `id=GUID`
-- `find:missing-resources`: scan the export tree for missing local resources or moved resource paths
+### `fix:wiz-links`
 
-To repair moved resource directories directly:
+Rewrite broken wikilinks that still contain `id=GUID`:
 
 ```bash
+npm run fix:wiz-links
+```
+
+### `clean:obsidian-tags`
+
+Clean misdetected tags and frontmatter noise:
+
+```bash
+npm run clean:obsidian-tags
+```
+
+### `find:missing-resources`
+
+Scan for missing resources and moved resource paths:
+
+```bash
+npm run find:missing-resources
 node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+### `sync_note_file_times.py`
+
+Sync Finder birth/modified times from note frontmatter:
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
 ```
 
 ## Output Layout

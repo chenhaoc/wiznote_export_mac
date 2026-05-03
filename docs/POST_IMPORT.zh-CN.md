@@ -32,3 +32,4 @@
 
 - 在目标笔记工具校验完成前，保留一份不可变的导出快照作为备份。
 - 在目标工具中进行大规模重命名、移动、清理之前，先做笔记级抽样检查。
+- 如果你在意 Finder 里的创建时间和修改时间，可以在导出目录上运行 `python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes`。

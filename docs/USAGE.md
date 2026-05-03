@@ -43,6 +43,56 @@ Verify exported files and rebuild the manifest:
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
+## Post-Export Cleanup
+
+These scripts are for the stage after export, when you want to clean up or validate the exported vault.
+
+Default assumptions:
+
+- current directory: `wiznote_export_mac/`
+- exported vault: `../export-wiznotes`
+
+### `coedit-attachments`
+
+Inspect attachment metadata from collaboration notes:
+
+```bash
+npm run coedit-attachments
+```
+
+### `fix:wiz-links`
+
+Rewrite broken wikilinks that still contain `id=GUID`:
+
+```bash
+npm run fix:wiz-links
+```
+
+### `clean:obsidian-tags`
+
+Clean misdetected tags and frontmatter noise:
+
+```bash
+npm run clean:obsidian-tags
+```
+
+### `find:missing-resources`
+
+Scan for missing resources and moved resource paths:
+
+```bash
+npm run find:missing-resources
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
+### `sync_note_file_times.py`
+
+Sync Finder birth/modified times from note frontmatter:
+
+```bash
+python3 scripts/sync_note_file_times.py --mode conservative ../export-wiznotes
+```
+
 ## Common Workflows
 
 ### 1. First full migration
@@ -105,6 +155,7 @@ Use `upgrade-legacy` only when you explicitly want to change the source notes in
 - `--limit N`: process only a limited number of notes
 - `--note-timeout-ms N`: per-note conversion timeout
 - `--attachment-timeout-ms N`: per attachment/resource timeout
+- `--mode conservative`: for `sync_note_file_times.py`, prefer `date modified` / `date created` when present
 
 ## Output Files
 
