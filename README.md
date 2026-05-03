@@ -85,6 +85,28 @@ node scripts/wiz-export.js export --out ./export --fetch-missing --attachments -
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
+## 维护脚本
+
+导出后的本地整理和校验可以直接用这些脚本：
+
+```bash
+npm run coedit-attachments
+npm run clean:obsidian-tags
+npm run fix:wiz-links
+npm run find:missing-resources
+```
+
+- `coedit-attachments`：列出协作笔记里的 office/embed 附件元数据
+- `clean:obsidian-tags`：清理误识别的 Obsidian 标签和部分 frontmatter 噪声
+- `fix:wiz-links`：修正导出后带 `id=GUID` 的损坏 wikilink
+- `find:missing-resources`：扫描导出目录里缺失或位置变动的本地资源引用
+
+如果需要修正 moved 资源目录，可以直接运行：
+
+```bash
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
 ## 输出结构
 
 每篇笔记的输出形式：

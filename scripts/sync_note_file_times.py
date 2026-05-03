@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-根据 Markdown frontmatter 里的 `created` / `updated` 字段，
+根据 Markdown frontmatter 里的时间字段，
 回写 macOS 文件的创建时间和修改时间。
 
 使用方式：
@@ -15,9 +15,11 @@
 
 说明：
 - `created` 用于回写 Finder 里的创建时间（birth time）
-- `updated` 用于回写文件修改时间（mtime）
+- 默认使用 `updated` 回写文件修改时间（mtime）
+- `--mode conservative` 时，优先使用 `date modified` 回写 mtime，
+  缺失时再退回 `updated`
 - 仅处理 `.md` 文件
-- 没有 `created` / `updated` 的文件会跳过
+- 没有可用时间字段的文件会跳过
 """
 
 from __future__ import annotations
@@ -32,13 +34,17 @@ from pathlib import Path
 
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-FIELD_RE = re.compile(r'(?m)^(created|updated):\s*"?([^"\n]+)"?\s*$')
+FIELD_RE = re.compile(
+    r'(?mi)^(created|updated|date created|date modified):\s*"?([^"\n]+)"?\s*$'
+)
 
 
 @dataclass
 class NoteTimes:
     created: datetime | None
     updated: datetime | None
+    date_created: datetime | None
+    date_modified: datetime | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print every changed file during non-dry-run execution.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("standard", "conservative"),
+        default="standard",
+        help=(
+            "standard: use updated as mtime; "
+            "conservative: prefer date modified, fallback to updated."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -91,21 +106,73 @@ def parse_iso_datetime(raw_value: str) -> datetime:
     return dt.astimezone()
 
 
+def normalize_loose_seconds(raw_value: str) -> str:
+    value = raw_value.strip()
+    match = re.search(r"(?P<prefix>.*\d:)(?P<sec>\d+)(?P<suffix>\s*(?:[AaPp][Mm])?)$", value)
+    if not match:
+        return value
+    seconds = int(match.group("sec"))
+    if seconds <= 59:
+        return value
+    return f"{match.group('prefix')}59{match.group('suffix')}"
+
+
+def parse_local_datetime(raw_value: str) -> datetime:
+    value = normalize_loose_seconds(raw_value)
+    patterns = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y %I:%M:%S %p",
+        "%Y %I:%M %p",
+        "%Y %H:%M:%S",
+        "%Y %H:%M",
+    )
+    for pattern in patterns:
+        try:
+            dt = datetime.strptime(value, pattern)
+            return dt.astimezone()
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported local datetime format: {raw_value}")
+
+
 def extract_note_times(path: Path) -> NoteTimes:
     content = path.read_text(encoding="utf-8", errors="ignore")
     match = FRONTMATTER_RE.match(content)
     if not match:
-        return NoteTimes(created=None, updated=None)
+        return NoteTimes(created=None, updated=None, date_created=None, date_modified=None)
 
     # Only inspect the frontmatter block at the top of the note.
     created: datetime | None = None
     updated: datetime | None = None
+    date_created: datetime | None = None
+    date_modified: datetime | None = None
     for field, value in FIELD_RE.findall(match.group(1)):
-        if field == "created":
+        normalized = field.lower()
+        if normalized == "created":
             created = parse_iso_datetime(value)
-        elif field == "updated":
+        elif normalized == "updated":
             updated = parse_iso_datetime(value)
-    return NoteTimes(created=created, updated=updated)
+        elif normalized == "date created":
+            date_created = parse_local_datetime(value)
+        elif normalized == "date modified":
+            date_modified = parse_local_datetime(value)
+    return NoteTimes(
+        created=created,
+        updated=updated,
+        date_created=date_created,
+        date_modified=date_modified,
+    )
+
+
+def choose_created_time(note_times: NoteTimes) -> datetime | None:
+    return note_times.date_created or note_times.created
+
+
+def choose_modified_time(note_times: NoteTimes, mode: str) -> datetime | None:
+    if mode == "conservative":
+        return note_times.date_modified or note_times.updated
+    return note_times.updated
 
 
 def set_birth_time(path: Path, dt: datetime) -> None:
@@ -148,12 +215,14 @@ def main() -> int:
     for path in files:
         try:
             note_times = extract_note_times(path)
-            if not note_times.created and not note_times.updated:
+            created_dt = choose_created_time(note_times)
+            modified_dt = choose_modified_time(note_times, args.mode)
+            if not created_dt and not modified_dt:
                 skipped += 1
                 continue
 
-            created_text = note_times.created.isoformat() if note_times.created else "-"
-            updated_text = note_times.updated.isoformat() if note_times.updated else "-"
+            created_text = created_dt.isoformat() if created_dt else "-"
+            updated_text = modified_dt.isoformat() if modified_dt else "-"
 
             if args.dry_run:
                 print(f"DRY {path}")
@@ -162,10 +231,10 @@ def main() -> int:
                 changed += 1
                 continue
 
-            if note_times.created:
-                set_birth_time(path, note_times.created)
-            if note_times.updated:
-                set_modified_time(path, note_times.updated)
+            if created_dt:
+                set_birth_time(path, created_dt)
+            if modified_dt:
+                set_modified_time(path, modified_dt)
             if args.verbose:
                 print(f"OK  {path}")
             changed += 1

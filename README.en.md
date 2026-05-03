@@ -85,6 +85,28 @@ Verify and rebuild the manifest from files on disk:
 node scripts/wiz-export.js verify --out ./export --rewrite-manifest
 ```
 
+## Maintenance Scripts
+
+For post-export cleanup and validation, these scripts are available:
+
+```bash
+npm run coedit-attachments
+npm run clean:obsidian-tags
+npm run fix:wiz-links
+npm run find:missing-resources
+```
+
+- `coedit-attachments`: list office/embed attachment metadata from collaboration notes
+- `clean:obsidian-tags`: clean misdetected Obsidian tags and some frontmatter noise
+- `fix:wiz-links`: rewrite broken wikilinks that still contain `id=GUID`
+- `find:missing-resources`: scan the export tree for missing local resources or moved resource paths
+
+To repair moved resource directories directly:
+
+```bash
+node scripts/find-missing-local-resources.js ../export-wiznotes --fix-moved
+```
+
 ## Output Layout
 
 Each note is written as:

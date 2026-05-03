@@ -7,7 +7,11 @@
   "scripts": {
     "status": "node scripts/wiz-export.js status",
     "export": "node scripts/wiz-export.js export",
-    "verify": "node scripts/wiz-export.js verify"
+    "verify": "node scripts/wiz-export.js verify",
+    "coedit-attachments": "node scripts/wiz-export.js coedit-attachments --json",
+    "find:missing-resources": "node scripts/find-missing-local-resources.js ../export-wiznotes",
+    "clean:obsidian-tags": "node scripts/clean-obsidian-tags.js ../export-wiznotes",
+    "fix:wiz-links": "node scripts/fix-wiznote-links.js ../export-wiznotes"
   },
   "engines": {
     "node": ">=24"

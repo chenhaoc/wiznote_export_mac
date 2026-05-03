@@ -14,11 +14,15 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_PROFILE = path.join(os.homedir(), "Library/Application Support/WizNote");
-const DEFAULT_LIVE_EDITOR =
-  "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js";
+const LIVE_EDITOR_CANDIDATES = [
+  "/Applications/为知笔记.app/Contents/Resources/assets/wizres/live-editor/index.js",
+  "/Applications/WizNote.app/Contents/Resources/assets/wizres/live-editor/index.js",
+  "/Applications/WizNotePlus.app/Contents/Resources/assets/wizres/live-editor/index.js",
+];
+const DEFAULT_LIVE_EDITOR = LIVE_EDITOR_CANDIDATES.find((candidate) => fs.existsSync(candidate)) || LIVE_EDITOR_CANDIDATES[0];
 const DEFAULT_OUT = path.resolve(process.cwd(), "export");
 
-const COMMANDS = new Set(["status", "snapshot", "export", "warm", "verify", "upgrade-legacy", "help"]);
+const COMMANDS = new Set(["status", "snapshot", "export", "warm", "verify", "upgrade-legacy", "coedit-attachments", "help"]);
 
 function usage() {
   return `Usage:
@@ -28,6 +32,7 @@ function usage() {
   node scripts/wiz-export.js warm --out DIR [--failed-only] [--limit N] [--only DOC_GUID]
   node scripts/wiz-export.js verify --out DIR [--rewrite-manifest] [--coedit-only] [--web-clips-only] [--only DOC_GUID]
   node scripts/wiz-export.js upgrade-legacy --out DIR [--dry-run] [--resume] [--limit N] [--only DOC_GUID] [--yes]
+  node scripts/wiz-export.js coedit-attachments [--only DOC_GUID] [--json]
 
 Options:
   --out DIR          Export output directory. Default: ./export
@@ -1772,6 +1777,45 @@ if (!window.__WIZ_EXPORT__) {
     };
   }
 
+  function collectCoEditAttachmentMetas(value) {
+    const doc = normalizeCoEditDocData(value);
+    const blocks = doc && Array.isArray(doc.blocks) ? doc.blocks : [];
+    const metas = [];
+    const seen = new Set();
+
+    const pushMeta = (embedData) => {
+      if (!embedData || typeof embedData !== "object") return;
+      const src = String(embedData.src || "").trim();
+      if (!src || isExternalResource(src)) return;
+      const resourceName = normalizeResourceName(src);
+      if (!resourceName) return;
+      const key = resourceName.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      metas.push({
+        source: src,
+        resourceName,
+        fileName: sanitizeFileName(
+          embedData.fileName || embedData.name || embedData.title || resourceName,
+          "attachment"
+        ),
+      });
+    };
+
+    const visitBlocks = (items) => {
+      for (const block of items || []) {
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "embed" && block.embedType === "office") {
+          pushMeta(block.embedData);
+        }
+        if (Array.isArray(block.children)) visitBlocks(block.children);
+      }
+    };
+
+    visitBlocks(blocks);
+    return metas;
+  }
+
   function findOpenCoEditEditor(note) {
     if (!window.LiveEditor || typeof window.LiveEditor.getEditor !== "function") return null;
     const roots = Array.from(document.querySelectorAll(".editor-main, .note-root-container, [contenteditable='true'], [data-doc-id]"));
@@ -1965,6 +2009,16 @@ if (!window.__WIZ_EXPORT__) {
     const refs = [];
     const byName = new Map();
     const usedFileNames = new Set();
+    const attachmentFileNameByResourceName = new Map();
+
+    function setAttachmentMetaEntries(entries) {
+      attachmentFileNameByResourceName.clear();
+      for (const entry of entries || []) {
+        if (!entry || !entry.resourceName || !entry.fileName) continue;
+        attachmentFileNameByResourceName.set(String(entry.resourceName).toLowerCase(), String(entry.fileName));
+      }
+    }
+
     function reserve(src, kind = "resource") {
       const source = String(Array.isArray(src) ? src[0] : src || "").trim();
       const resourceName = normalizeResourceName(source);
@@ -1973,7 +2027,10 @@ if (!window.__WIZ_EXPORT__) {
         if (kind === "attachment") existing.kind = "attachment";
         return existing;
       }
-      let fileName = sanitizeFileName(resourceName, "resource");
+      const preferredFileName = kind === "attachment"
+        ? attachmentFileNameByResourceName.get(String(resourceName).toLowerCase())
+        : "";
+      let fileName = sanitizeFileName(preferredFileName || resourceName, "resource");
       const ext = fileName.includes(".") ? fileName.replace(/^.*(\.[^.]+)$/, "$1") : "";
       const base = ext ? fileName.slice(0, -ext.length) : fileName;
       let unique = fileName;
@@ -1994,7 +2051,7 @@ if (!window.__WIZ_EXPORT__) {
       const ref = reserve(source);
       return markdownUrl(assetDirName + "/" + ref.fileName);
     }
-    return { refs, reserve, buildResourceUrl };
+    return { refs, reserve, buildResourceUrl, setAttachmentMetaEntries };
   }
 
   function cleanMarkdownHref(href) {
@@ -2019,11 +2076,16 @@ if (!window.__WIZ_EXPORT__) {
     return !/^md(?:own)?$/i.test(ext[1]);
   }
 
+  function isSvgFileName(fileName) {
+    return String(fileName || "").toLowerCase().endsWith(".svg");
+  }
+
   function rewriteLocalAttachmentLinks(markdown, collector, assetDirName) {
     return String(markdown || "").replace(/(!?\[[^\]\n]*\]\()([^)\s]+)(\))/g, (match, prefix, href, suffix) => {
       if (!isLikelyLocalAttachmentHref(href, assetDirName)) return match;
       const ref = collector.reserve(cleanMarkdownHref(href), prefix.startsWith("!") ? "resource" : "attachment");
-      return prefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
+      const nextPrefix = !prefix.startsWith("!") && isSvgFileName(ref.fileName) ? "!" + prefix : prefix;
+      return nextPrefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
     });
   }
 
@@ -2559,6 +2621,7 @@ if (!window.__WIZ_EXPORT__) {
         } else {
           const docData = normalizeCoEditDocData(data);
           coEditMeta = (docData && docData.meta) || data.meta || null;
+          collector.setAttachmentMetaEntries(collectCoEditAttachmentMetas(docData));
           if (!source) source = "live-editor-offline-doc";
           if (payload.plainText) {
             source += "-plain-text";
@@ -2840,6 +2903,15 @@ if (!window.__WIZ_EXPORT__) {
   helper.upgradeLegacyNote = upgradeLegacyNote;
   helper.fetchResources = fetchResources;
   helper.fetchLegacyAttachments = fetchLegacyAttachments;
+  helper.readCoEditAttachmentMetas = async (payload) => {
+    const note = payload && payload.note ? payload.note : {};
+    if (!window.LiveEditor || !window.LiveEditor.getOfflineDocData) return [];
+    let data = null;
+    try {
+      data = await window.LiveEditor.getOfflineDocData(note.kbGuid, note.docGuid);
+    } catch {}
+    return collectCoEditAttachmentMetas(data);
+  };
   window.__WIZ_EXPORT__ = helper;
 }
 `;
@@ -3077,11 +3149,16 @@ function categorySegments(category) {
     .map((part) => sanitizePathSegment(part, "Folder"));
 }
 
+function isMeaningfulObsidianTag(tag) {
+  const value = String(tag || "").trim();
+  return !!value && !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+}
+
 function tagsFromDoc(doc) {
   return String(doc.tags || "")
     .split(/[,*]/)
     .map((tag) => tag.trim())
-    .filter(Boolean);
+    .filter(isMeaningfulObsidianTag);
 }
 
 function isExternalResource(src) {
@@ -3146,6 +3223,10 @@ function isLikelyLocalAttachmentHref(href, assetDirName) {
   return !/^md(?:own)?$/i.test(ext[1]);
 }
 
+function isSvgFileName(fileName) {
+  return path.extname(String(fileName || "")).toLowerCase() === ".svg";
+}
+
 const LEGACY_ATTACHMENT_SECTION_START = "<!-- wiznote-legacy-attachments:start -->";
 const LEGACY_ATTACHMENT_SECTION_END = "<!-- wiznote-legacy-attachments:end -->";
 
@@ -3157,10 +3238,11 @@ function legacyAttachmentSectionRegExp() {
   );
 }
 
-function collectLocalAttachmentLinks(markdown, assetDirName) {
+function collectLocalAttachmentLinks(markdown, assetDirName, options = {}) {
   const refs = [];
   const byName = new Map();
   const usedFileNames = new Set();
+  const fileNameByResourceName = options.fileNameByResourceName || new Map();
 
   function reserve(href, kind) {
     const source = cleanMarkdownHref(href);
@@ -3170,7 +3252,10 @@ function collectLocalAttachmentLinks(markdown, assetDirName) {
       if (kind === "attachment") existing.kind = "attachment";
       return existing;
     }
-    let fileName = sanitizeFileName(resourceName, "attachment");
+    const preferredFileName = kind === "attachment"
+      ? fileNameByResourceName.get(String(resourceName).toLowerCase())
+      : "";
+    let fileName = sanitizeFileName(preferredFileName || resourceName, "attachment");
     const ext = fileName.includes(".") ? fileName.replace(/^.*(\.[^.]+)$/, "$1") : "";
     const base = ext ? fileName.slice(0, -ext.length) : fileName;
     let unique = fileName;
@@ -3200,8 +3285,12 @@ function collectLocalAttachmentLinks(markdown, assetDirName) {
       !/\.md(?:own)?$/i.test(decoded);
     if (!existingAssetAttachment && !isLikelyLocalAttachmentHref(href, assetDirName)) return match;
     const ref = reserve(existingAssetAttachment ? basenameFromUrl(decoded) : href, isImage ? "resource" : "attachment");
-    if (existingAssetAttachment) return match;
-    return prefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
+    if (existingAssetAttachment) {
+      if (!isImage && isSvgFileName(decoded)) return "!" + prefix + href + suffix;
+      return match;
+    }
+    const nextPrefix = !isImage && isSvgFileName(ref.fileName) ? "!" + prefix : prefix;
+    return nextPrefix + markdownUrl(assetDirName + "/" + ref.fileName) + suffix;
   });
 
   const text = String(markdown || "");
@@ -3217,6 +3306,30 @@ function collectLocalAttachmentLinks(markdown, assetDirName) {
 
   return { markdown: rewritten, refs };
 }
+
+  function rewriteExportedAttachmentAssetLinks(markdown, assetDirName, options = {}) {
+    const fileNameByCurrentName = options.fileNameByCurrentName || new Map();
+    const pattern = /(!?\[[^\]\n]*\]\()([^)\s]+)(\))/g;
+    return String(markdown || "").replace(pattern, (match, prefix, href, suffix) => {
+      const isImage = prefix.startsWith("!");
+    if (isImage) return match;
+    const clean = cleanMarkdownHref(href);
+    const noSuffix = clean.split("#")[0].split("?")[0];
+    let decoded = noSuffix;
+    try {
+      decoded = decodeURIComponent(noSuffix);
+    } catch {}
+      if (!decoded.startsWith(assetDirName + "/")) return match;
+      const fileName = decoded.slice(assetDirName.length + 1);
+      const replacement = fileNameByCurrentName.get(String(fileName).toLowerCase());
+      const targetName = replacement || fileName;
+      if (!isImage && isSvgFileName(targetName)) {
+        return "!" + prefix + markdownUrl(assetDirName + "/" + targetName) + suffix;
+      }
+      if (!replacement || replacement === fileName) return match;
+      return prefix + markdownUrl(assetDirName + "/" + replacement) + suffix;
+    });
+  }
 
 function legacyAttachmentFilePlans(attachments) {
   const used = new Set();
@@ -3293,8 +3406,10 @@ function frontmatter(doc, attachments, bodyAttachments = []) {
   if (created) lines.push(`created: ${yamlString(created)}`);
   if (updated) lines.push(`updated: ${yamlString(updated)}`);
   const tags = tagsFromDoc(doc);
-  lines.push("tags:");
-  for (const tag of tags) lines.push(`  - ${yamlString(tag)}`);
+  if (tags.length) {
+    lines.push("tags:");
+    for (const tag of tags) lines.push(`  - ${yamlString(tag)}`);
+  }
   lines.push(`wiznote_attachment_count: ${attachments.length + bodyAttachments.length}`);
   if (bodyAttachments.length) lines.push(`wiznote_body_attachment_count: ${bodyAttachments.length}`);
   if (attachments.length && bodyAttachments.length) lines.push(`wiznote_legacy_attachment_count: ${attachments.length}`);
@@ -4220,6 +4335,7 @@ async function runAttachmentsOnly(args) {
   const snapshot = await readSnapshot(args);
   const indexes = buildIndexes(snapshot);
   const docsByKey = new Map(indexes.docs.map((doc) => [noteKey(doc.kbGuid, doc.docGuid), doc]));
+  const scanned = await scanExportedMarkdownMap(args.out);
   const selected = (manifest.notes || [])
     .filter((note) => note && note.ok && (!args.only || note.docGuid === args.only))
     .slice(0, args.limit || undefined);
@@ -4247,6 +4363,20 @@ async function runAttachmentsOnly(args) {
           current += 1;
           continue;
         }
+        const scannedRecord = scanned.byDocGuid.get(noteRecord.docGuid);
+        if (scannedRecord) {
+          noteRecord.markdownPath = scannedRecord.relativePath;
+          noteRecord.assetDir = scannedRecord.assetDirRel;
+          if (Array.isArray(scannedRecord.resources) && scannedRecord.resources.length) {
+            noteRecord.resources = scannedRecord.resources;
+          }
+          if (Array.isArray(scannedRecord.attachments) && scannedRecord.attachments.length) {
+            const preserved = (noteRecord.attachments || []).filter((att) =>
+              att && att.kind !== "markdown-local-link"
+            );
+            noteRecord.attachments = preserved.concat(scannedRecord.attachments);
+          }
+        }
         const markdownPath = path.join(args.out, noteRecord.markdownPath);
         if (!(await pathExists(markdownPath))) {
           current += 1;
@@ -4262,8 +4392,30 @@ async function runAttachmentsOnly(args) {
         const previousOtherAttachments = previousAttachments.filter((att) => att.kind !== "legacy-indexeddb" && att.kind !== "coedit-body-link");
         const processBodyAttachments = !args.legacyAttachmentsOnly && isCoEdit(doc.type);
         const processLegacyAttachments = !args.bodyAttachmentsOnly;
+        let attachmentMetas = [];
+        if (processBodyAttachments) {
+          const expression = `window.__WIZ_EXPORT__.readCoEditAttachmentMetas(${JSON.stringify({ note: doc })})`;
+          attachmentMetas = await cdp.evaluate(expression).catch(() => []);
+        }
+        const fileNameByResourceName = new Map(
+          (attachmentMetas || [])
+            .filter((item) => item && item.resourceName && item.fileName)
+            .map((item) => [String(item.resourceName).toLowerCase(), String(item.fileName)])
+        );
+        const fileNameByCurrentName = new Map();
+        for (const item of attachmentMetas || []) {
+          if (!item || !item.fileName) continue;
+          if (item.resourceName) fileNameByCurrentName.set(String(item.resourceName).toLowerCase(), String(item.fileName));
+          if (item.source) {
+            const sourceName = normalizeResourceName(item.source);
+            if (sourceName) fileNameByCurrentName.set(String(sourceName).toLowerCase(), String(item.fileName));
+          }
+        }
+        const preRewrittenMarkdown = processBodyAttachments
+          ? rewriteExportedAttachmentAssetLinks(originalMarkdown, assetDirName, { fileNameByCurrentName })
+          : originalMarkdown;
         const collected = processBodyAttachments
-          ? collectLocalAttachmentLinks(originalMarkdown, assetDirName)
+          ? collectLocalAttachmentLinks(preRewrittenMarkdown, assetDirName, { fileNameByResourceName })
           : { markdown: originalMarkdown, refs: [] };
         const refs = processBodyAttachments ? collected.refs.filter((ref) => ref.kind === "attachment") : [];
         const legacyAttachments = processLegacyAttachments
@@ -4292,7 +4444,37 @@ async function runAttachmentsOnly(args) {
               path: path.relative(args.out, existingPath),
             });
           } else {
-            refsToFetch.push(ref);
+            const fallbackNames = [];
+            const fallbackResourceName = sanitizeFileName(ref.resourceName, "attachment");
+            if (fallbackResourceName && fallbackResourceName !== ref.fileName) fallbackNames.push(fallbackResourceName);
+            const fallbackSourceName = sanitizeFileName(basenameFromUrl(ref.source), "attachment");
+            if (fallbackSourceName && fallbackSourceName !== ref.fileName && !fallbackNames.includes(fallbackSourceName)) {
+              fallbackNames.push(fallbackSourceName);
+            }
+            let restored = false;
+            for (const fallbackName of fallbackNames) {
+              const fallbackPath = path.join(assetDir, fallbackName);
+              const fallbackStat = await fsp.stat(fallbackPath).catch(() => null);
+              if (!fallbackStat || fallbackStat.size <= 0) continue;
+              try {
+                await fsp.mkdir(path.dirname(existingPath), { recursive: true });
+                await fsp.rename(fallbackPath, existingPath);
+              } catch (err) {
+                if (!(await pathExists(existingPath))) throw err;
+              }
+              existingResources.push({
+                ...ref,
+                ok: true,
+                source: "existing-export-renamed",
+                originalSource: ref.source,
+                fetchSource: "existing-export-renamed",
+                byteLength: fallbackStat.size,
+                path: path.relative(args.out, existingPath),
+              });
+              restored = true;
+              break;
+            }
+            if (!restored) refsToFetch.push(ref);
           }
         }
 
@@ -4578,6 +4760,51 @@ async function runWarm(args) {
     if (skipped) console.log(`Skipped already local: ${skipped}`);
     if (failed) console.log(`Warm failed: ${failed}`);
     console.log(`Manifest: ${manifestPath}`);
+  }
+}
+
+async function runCoEditAttachments(args) {
+  const snapshot = await readSnapshot(args);
+  const indexes = buildIndexes(snapshot);
+  let docs = indexes.docs.filter((doc) => isCoEdit(doc.type));
+  if (args.only) docs = docs.filter((doc) => doc.docGuid === args.only);
+  docs = sortDocsByTree(docs);
+
+  const notes = [];
+  await withBrowser(args, async (cdp) => {
+    await cdp.evaluate("window.__WIZ_EXPORT__.installLiveEditor()");
+    for (const doc of docs) {
+      const metas = await cdp.evaluate(`window.__WIZ_EXPORT__.readCoEditAttachmentMetas(${JSON.stringify({ note: doc })})`).catch(() => []);
+      notes.push({
+        docGuid: doc.docGuid,
+        kbGuid: doc.kbGuid,
+        title: doc.title || "",
+        category: doc.category || "",
+        attachments: Array.isArray(metas) ? metas : [],
+      });
+    }
+  }, { includeResourceCache: false });
+
+  const result = {
+    ok: true,
+    notes,
+  };
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(`coedit notes: ${notes.length}`);
+  for (const note of notes) {
+    console.log("");
+    console.log(`# ${note.title || note.docGuid}`);
+    console.log(`docGuid: ${note.docGuid}`);
+    console.log(`kbGuid: ${note.kbGuid}`);
+    console.log(`category: ${note.category || "/"}`);
+    console.log(`attachments: ${note.attachments.length}`);
+    for (const att of note.attachments) {
+      console.log(`- ${att.fileName} <= ${att.source}`);
+    }
   }
 }
 
@@ -5043,6 +5270,7 @@ async function main() {
     else if (args.command === "warm") await runWarm(args);
     else if (args.command === "verify") await runVerify(args);
     else if (args.command === "upgrade-legacy") await runUpgradeLegacy(args);
+    else if (args.command === "coedit-attachments") await runCoEditAttachments(args);
     else if (args.command === "export") await runExport(args);
   } catch (err) {
     if (args && args.json) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
